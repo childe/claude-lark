@@ -17,7 +17,7 @@
 - 权限请求永不默认同意：hook 出错、超时、收到无法识别的回复，都不能输出 `allow`。
 - 只处理绑定者（`config.json` 里的 `owner_open_id`）发来的消息。
 - 发飞书消息一律 `--as bot`。
-- 仓库是 GitHub 公开仓库：任何提交不得包含 app id（`cli_` 开头）、open_id（`ou_`）、chat_id（`oc_`）、token、公司名和内部域名、本机绝对路径（`/Users/`）。公司相关关键词**不得出现在仓库里，包括扫描脚本本身**：它们放在本地不提交的 `.secret-patterns` 文件里（已 gitignore），实现者向用户索取内容。测试数据用明显的假值，例如 `ou_test_owner`、`oc_test_chat`（扫描规则对 `_test_` 放行）。
+- 仓库是 GitHub 公开仓库：任何提交不得包含 app id（`cli_` 开头）、open_id（`ou_`）、chat_id（`oc_`）、token、公司名和内部域名、本机绝对路径（`/[U]sers/` 开头的路径）。公司相关关键词**不得出现在仓库里，包括扫描脚本本身**：它们放在本地不提交的 `.secret-patterns` 文件里（已 gitignore），实现者向用户索取内容。测试数据用明显的假值，例如 `ou_test_owner`、`oc_test_chat`（扫描规则对 `_test_` 放行）。
 - git 提交身份是 `childe <rmself@qq.com>`（仓库已配置），提交信息以 `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` 结尾。
 - 每次改代码后运行 `black .`（有 venv 用 venv 的，否则 `/opt/homebrew/bin/black`）。
 - 用户可见文案用中文。
@@ -88,8 +88,8 @@ README.md
 - [ ] **Step 2**：`uv run --with pytest pytest tests/test_paths.py -v`，预期 FAIL（模块不存在）。
 - [ ] **Step 3**：实现 `paths.py`；`bin/claude-lark` 把自身所在仓库根（`Path(__file__).resolve().parent.parent`）加入 `sys.path` 后调用 `lark_bridge.cli.main(sys.argv[1:])`；`cli.main` 暂时只认 `--version`。
 - [ ] **Step 4**：测试 PASS。
-- [ ] **Step 5**：写 `scripts/scan-secrets.sh`：对 `git diff --cached` 的新增行（或传入的文件）用 grep -E 匹配通用规则 `cli_[a-z0-9]{8,}|ou_[0-9a-f]{8,}|oc_[0-9a-f]{8,}|/Users/|/home/[a-z]|app_secret|tenant_access_token`，再加上仓库根目录 `.secret-patterns`（存在时，每行一个正则，gitignore）里的规则，命中则打印并 exit 1。安装为 `.git/hooks/pre-commit`（README 的开发者章节说明；本地执行 `ln -s ../../scripts/scan-secrets.sh .git/hooks/pre-commit`）。
-- [ ] **Step 6**：验证：在 scratchpad 建文件写入 `ou_0123456789abcdef`，`scripts/scan-secrets.sh <file>` 预期 exit 1；写入 `ou_test_owner` 预期 exit 0。
+- [ ] **Step 5**：写 `scripts/scan-secrets.sh`：对 `git diff --cached` 的新增行（或传入的文件）用 grep -E 匹配通用规则 `cli_[a-z0-9]{8,}|ou_[0-9a-f]{8,}|oc_[0-9a-f]{8,}|/[U]sers/|/home/[a-z]|app_[s]ecret|tenant_[a]ccess_token`（`[x]` 括号写法与字面量等价，只是避免命中扫描自己），再加上仓库根目录 `.secret-patterns`（存在时，每行一个正则，gitignore）里的规则，命中则打印并 exit 1。安装为 `.git/hooks/pre-commit`（README 的开发者章节说明；本地执行 `ln -s ../../scripts/scan-secrets.sh .git/hooks/pre-commit`）。
+- [ ] **Step 6**：验证：在 scratchpad 建文件写入一个真实形状的 open_id（`ou_` 后接 16 位十六进制，即 `ou_` + `0123456789abcdef` 拼起来），`scripts/scan-secrets.sh <file>` 预期 exit 1；写入 `ou_test_owner` 预期 exit 0。
 - [ ] **Step 7**：black，提交 `feat: project skeleton and secret scan`。
 
 ### Task 2: 会话状态（state.py）

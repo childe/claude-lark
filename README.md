@@ -38,7 +38,7 @@ claude-lark 把一个**正在运行**的 Claude Code 会话桥接到飞书群，
 - 回到电脑前：先按 `Esc` 拿回终端，再 `/lark off` 停止同步（群里发 `/off` 也行）。
 - 安装：`git clone https://github.com/childe/claude-lark ~/.claude/lark-src && ~/.claude/lark-src/install.sh`，然后重启已经开着的 claude 会话。
 - 前置：Python ≥ 3.9、Claude Code ≥ 2.1.287、`lark-cli` ≥ 1.0.92，以及一个开了机器人能力、订阅了 `im.message.receive_v1`（长连接）的飞书自建应用。
-- 限制：同一个飞书应用的消息事件同一时刻只能被一个监听方消费；续命上限约 41 天；resume 后不自动重连；不能从飞书远程启动 claude。
+- 限制：同一个飞书应用的消息事件同一时刻只能被一个监听方消费；一次 `/lark` 之后最多连续约 1000 次 hook 阻塞（群消息回合和续命回合都算，终端里输入一次就清零）；resume 后不自动重连；不能从飞书远程启动 claude。
 - 把仓库链接贴给你的 AI 助手说"帮我装"也可以，见 [For AI agents](#for-ai-agents)。
 
 ## Prerequisites
@@ -95,7 +95,7 @@ What `install.sh` does, and what you should see (it is idempotent; run it again 
 3. Symlinks the repo to `~/.claude/lark/app` and `commands/lark.md` to `~/.claude/commands/lark.md`.
 4. Merges six hooks (`Stop`, `PermissionRequest`, `PreToolUse` with matcher `AskUserQuestion`, `UserPromptSubmit`, `SessionStart`, `SessionEnd`) and the env var `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP=1000` into `~/.claude/settings.json`, leaving everything else as it was. Output: `已更新 ... （已备份到 ...）` or `无需改动`.
 5. Records the logged-in Feishu user as the only allowed owner: `已写入 ~/.claude/lark/config.json`.
-6. Runs `claude-lark doctor`. Every line should start with `✅` and the last line should be `全部通过`. A `❌` line is followed by a `修复：` line telling you what to do; install itself still succeeds.
+6. Runs `claude-lark doctor`. Every check line should start with `✅` and the last line should be `全部通过`. A `❌` line is followed by a `修复：` line telling you what to do; install itself still succeeds.
 
 **Restart every already-running `claude` session once.** Hooks and the `/lark` command are only loaded at session start.
 
@@ -130,7 +130,7 @@ with a backup.
    Success: exit code 0 and the last line says to restart running claude sessions. On failure: read the `❌` line; typical causes are a missing `python3`/`lark-cli` (go back to step 1), an existing non-symlink `~/.claude/lark/app` or `~/.claude/commands/lark.md` (ask the human before moving it away), an invalid `~/.claude/settings.json` (ask the human to fix the JSON; do not overwrite it), or not logged in (step 3).
 
 5. **Run doctor.** Run `~/.claude/lark/app/bin/claude-lark doctor`.
-   Success: exit code 0 and the last line `全部通过`, all lines `✅`. On failure: for each `❌` line run the command in the `修复：` line that follows it, and re-run doctor until it is clean. Special cases:
+   Success: exit code 0 and the last line `全部通过`, every check line `✅`. On failure: for each `❌` line run the command in the `修复：` line that follows it, and re-run doctor until it is clean. Special cases:
    - `事件订阅前置条件未通过` (event subscription preconditions failed): **[HUMAN]** in the developer console, publish the app, subscribe to `im.message.receive_v1` with the long connection, and grant the scopes from the table above. This cannot be done from the command line. Stop and ask the human; after they confirm, re-run doctor.
    - `owner 与当前登录用户不一致`: run `~/.claude/lark-src/install.sh` again.
    - A line about `settings.json` or `lark.md`: run `~/.claude/lark-src/install.sh` again.
@@ -172,7 +172,7 @@ you want syncing to stop.
 ## Limitations
 
 - **One listener per Feishu app.** A Feishu app's message events must not be consumed by another machine or program at the same time, or each side receives only part of the messages. Use a separate app per machine, or stop the other consumer.
-- **Keep-alive limit of about 41 days.** To stay in the waiting state, the Stop hook keeps blocking turn after turn (cap 1000, with a reminder at the 950th); after about 41 days of continuous waiting the session will end the wait and you need to `/lark` again.
+- **About 1000 consecutive hook blocks.** To stay in the waiting state, the Stop hook keeps blocking turn after turn. Claude Code caps consecutive blocks (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP=1000`), and every block counts: each turn that delivers a group message and each keep-alive turn (one per hour or so of silence). The counter resets when you type a prompt in the terminal. A reminder is sent to the group at the 950th block; at the cap the session stops waiting and says so in the group, and you need to come back to the terminal.
 - **Resume does not reconnect automatically.** After `claude --resume` the group binding is remembered, but you must type `/lark` to turn the bridge on again (if you resumed in the terminal, you are at the computer).
 - **`/clear`, `/resume` and exiting disconnect.** When the bridged conversation ends (`/clear`, switching with `/resume`, or quitting claude), the bridge is turned off and the group gets a notice: 会话已结束（/clear 或退出），桥接已断开。终端里敲 /lark 可重新连接. `/compact` keeps the bridge.
 - **No remote start.** Feishu cannot start `claude`. After a reboot, run `claude --resume` at the computer first.
@@ -180,7 +180,7 @@ you want syncing to stop.
 - **Final replies only.** No mid-turn progress (commands run, files read) is sent.
 - **Group messages without @:** see the warning in Prerequisites; not yet verified on a live group.
 - **Versions and platforms.** Claude Code >= 2.1.287 (the versions it was tested on; hook behaviour is version-sensitive), `lark-cli` >= 1.0.92. macOS is tested; Linux is expected to work; Windows is not supported.
-- **Process detection.** claude installed via npm (a `node` process running the claude script) is detected from the process name plus arguments; a differently packaged build that matches neither may make `/lark` answer that it cannot identify the claude process. Please run `claude-lark doctor` and open an issue.
+- **Process detection.** claude installed via npm (a `node` or `bun` process running the claude script) is detected from the process name plus arguments; a differently packaged build that matches neither may make `/lark` answer that it cannot identify the claude process. Please run `claude-lark doctor` and open an issue.
 - It does not use Claude Code's channels mechanism (it needs launch flags).
 
 ## Uninstall
