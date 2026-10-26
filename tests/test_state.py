@@ -100,3 +100,22 @@ def test_append_repairs_partial_trailing_line(lark_home):
     state.append_inbox(SID, {"message_id": "om_test_3", "text": "c", "create_time": 3})
     msgs, _ = state.peek_inbox(SID)
     assert [m["message_id"] for m in msgs] == ["om_test_1", "om_test_3"]
+
+
+def test_peek_entries_gives_per_message_end_offsets(lark_home):
+    for i in (1, 2, 3):
+        state.append_inbox(
+            SID, {"message_id": f"om_test_{i}", "text": "é" * i, "create_time": i}
+        )
+    p = lark_home / "sessions" / SID / "inbox.jsonl"
+    with open(p, "ab") as f:
+        f.write(b"not json\n")
+    entries, off = state.peek_inbox_entries(SID)
+    assert [m["text"] for m, _ in entries] == ["é", "éé", "ééé"]
+    assert off == p.stat().st_size == state.peek_inbox(SID)[1]
+    # committing the 2nd message's end leaves exactly the 3rd
+    state.commit_cursor(SID, entries[1][1])
+    rest, _ = state.peek_inbox(SID)
+    assert [m["text"] for m in rest] == ["ééé"]
+    entries2, _ = state.peek_inbox_entries(SID)
+    assert entries2[0][1] == entries[2][1]

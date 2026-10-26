@@ -20,6 +20,7 @@ def fake(lark_home, tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_LARK_CLI", str(FAKE))
     monkeypatch.setenv("FAKE_LARK_LOG", str(log))
     monkeypatch.delenv("FAKE_LARK_FAIL", raising=False)
+    monkeypatch.delenv("FAKE_LARK_SLEEP", raising=False)
     monkeypatch.delenv("CLAUDE_LARK_WAIT_SECONDS", raising=False)
 
     def calls():
@@ -265,7 +266,7 @@ def test_stop_exception_is_logged_and_returns_empty(bridged, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("kaboom")
 
-    monkeypatch.setattr(hooks.state, "peek_inbox", boom)
+    monkeypatch.setattr(hooks.state, "peek_inbox_entries", boom)
     clock = Clock()
     assert hooks.run("stop", stop_input(), clock.now, clock.sleep) == ""
     assert "kaboom" in (state.paths.home() / "errors.log").read_text()

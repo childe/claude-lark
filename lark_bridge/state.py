@@ -129,8 +129,10 @@ def _cursor(sid) -> int:
         return 0
 
 
-def peek_inbox(sid):
-    """返回游标之后的完整行与新偏移，不移动游标。"""
+def peek_inbox_entries(sid):
+    """返回 ([(消息, 该行结束处的偏移), ...], 新偏移)，不移动游标。
+
+    commit 某条消息的结束偏移 = 消费它及文件中它之前的所有行。"""
     start = _cursor(sid)
     try:
         with open(_inbox(sid), "rb") as f:
@@ -139,15 +141,27 @@ def peek_inbox(sid):
     except OSError:
         return [], start
     end = data.rfind(b"\n") + 1
-    msgs = []
-    for line in data[:end].split(b"\n"):
+    entries = []
+    pos = 0
+    while pos < end:
+        nl = data.index(b"\n", pos)
+        line = data[pos:nl]
+        pos = nl + 1
         if not line.strip():
             continue
         try:
-            msgs.append(json.loads(line))
+            m = json.loads(line)
         except ValueError:
             continue
-    return msgs, start + end
+        if isinstance(m, dict):
+            entries.append((m, start + pos))
+    return entries, start + end
+
+
+def peek_inbox(sid):
+    """返回游标之后的完整行与新偏移，不移动游标。"""
+    entries, offset = peek_inbox_entries(sid)
+    return [m for m, _ in entries], offset
 
 
 def commit_cursor(sid, offset: int):

@@ -53,8 +53,10 @@ def _run(args, timeout=TIMEOUT) -> str:
     return r.stdout
 
 
-def send(chat_id: str, markdown: str) -> None:
-    """分段发送；任何失败只记 errors.log，不抛出。某段失败后不再发后续段。"""
+def send(chat_id: str, markdown: str, timeout: float = TIMEOUT) -> None:
+    """分段发送；任何失败只记 errors.log，不抛出。某段失败后不再发后续段。
+
+    timeout 是每一段的 lark-cli 超时秒数。"""
     try:
         for part in split_message(markdown):
             _run(
@@ -67,7 +69,8 @@ def send(chat_id: str, markdown: str) -> None:
                     chat_id,
                     "--markdown",
                     part,
-                ]
+                ],
+                timeout=timeout,
             )
     except FeishuError as e:
         log_error(f"send to {chat_id}: {e}")
