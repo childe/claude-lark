@@ -4,7 +4,7 @@ import os
 import re
 from pathlib import Path
 
-_SESSION_ID_RE = re.compile(r"^[0-9a-f-]+$")
+_SESSION_ID_RE = re.compile(r"[0-9a-f-]+")
 
 
 def home() -> Path:
@@ -15,7 +15,7 @@ def home() -> Path:
 
 
 def session_dir(session_id: str) -> Path:
-    if not isinstance(session_id, str) or not _SESSION_ID_RE.match(session_id):
+    if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
         raise ValueError(f"invalid session id: {session_id!r}")
     return home() / "sessions" / session_id
 

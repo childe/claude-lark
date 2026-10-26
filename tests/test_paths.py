@@ -23,7 +23,7 @@ def test_session_dir_ok(lark_home):
     assert paths.session_dir(sid) == lark_home / "sessions" / sid
 
 
-@pytest.mark.parametrize("bad", ["../x", "", "ABC", "a/b", "g1"])
+@pytest.mark.parametrize("bad", ["../x", "", "ABC", "a/b", "g1", "abc\n"])
 def test_session_dir_rejects_traversal(lark_home, bad):
     with pytest.raises(ValueError):
         paths.session_dir(bad)
