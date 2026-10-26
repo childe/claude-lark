@@ -125,7 +125,7 @@ def test_permission_ambiguous_reply_keeps_waiting(bridged):
     clock = Clock(arrive((1, msg(1, "好的吧", "1")), (4, msg(2, "同意", "2"))))
     out = hooks.run("permission", perm_input(), clock.now, clock.sleep)
     assert json.loads(out) == ALLOW
-    assert sent_texts(bridged())[1:] == ["请回复「同意」或「拒绝」", "✅ 已允许"]
+    assert sent_texts(bridged())[1:] == [hooks.MSG_PERM_HINT, "✅ 已允许"]
     assert state.peek_inbox(SID)[0] == []
     assert clock.sleeps >= 4
 
@@ -170,7 +170,7 @@ def test_permission_commits_only_up_to_deciding_message(bridged):
     assert json.loads(out) == ALLOW
     assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["然后部署"]
     # no hint: the batch contained a decision
-    assert "请回复「同意」或「拒绝」" not in sent_texts(bridged())
+    assert hooks.MSG_PERM_HINT not in sent_texts(bridged())
 
 
 def test_permission_first_decision_wins(bridged):
@@ -186,7 +186,7 @@ def test_permission_ignores_replies_sent_before_prompt(bridged):
     out = hooks.run("permission", perm_input(), clock.now, clock.sleep)
     assert json.loads(out) == DENY
     assert clock.sleeps >= 3  # kept waiting despite the queued "1"
-    assert "请回复「同意」或「拒绝」" not in sent_texts(bridged())
+    assert hooks.MSG_PERM_HINT not in sent_texts(bridged())
     # the early "1" is still delivered, once, by the next Stop hook
     out = hooks.run("stop", stop_input(None), clock.now, clock.sleep)
     assert json.loads(out)["reason"] == DELIVER_PREFIX + "1"
@@ -652,7 +652,7 @@ def test_ambiguous_hint_uses_short_timeout(bridged, monkeypatch):
     monkeypatch.setattr(feishu, "_run", spy)
     clock = Clock(arrive((1, msg(1, "嗯", "1")), (3, msg(2, "同意", "2"))))
     hooks.run("permission", perm_input(), clock.now, clock.sleep)
-    assert ("请回复「同意」或「拒绝」", 5) in seen
+    assert (hooks.MSG_PERM_HINT, 5) in seen
     assert ("✅ 已允许", 5) in seen
 
 
@@ -675,3 +675,16 @@ def test_cli_sigterm_after_run_does_not_lose_output(bridged, monkeypatch):
     assert cli.main(["hook", "stop"]) == 0
     assert json.loads(out.getvalue())["reason"] == DELIVER_PREFIX + "from cli"
     assert signal.getsignal(signal.SIGTERM) is before
+
+
+# ------------------------------------------------ final review
+
+
+HINT_IGNORED = "上一条消息不是「同意/拒绝」，已被忽略；请回复「同意」或「拒绝」"
+
+
+def test_permission_ambiguous_hint_says_message_was_ignored(bridged):
+    clock = Clock(arrive((1, msg(1, "顺便看下日志", "1")), (3, msg(2, "同意", "2"))))
+    out = hooks.run("permission", perm_input(), clock.now, clock.sleep)
+    assert json.loads(out) == ALLOW
+    assert HINT_IGNORED in sent_texts(bridged())
