@@ -266,7 +266,7 @@ def test_stop_exception_is_logged_and_returns_empty(bridged, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("kaboom")
 
-    monkeypatch.setattr(hooks.state, "peek_inbox_entries", boom)
+    monkeypatch.setattr(hooks.state, "peek_inbox", boom)
     clock = Clock()
     assert hooks.run("stop", stop_input(), clock.now, clock.sleep) == ""
     assert "kaboom" in (state.paths.home() / "errors.log").read_text()

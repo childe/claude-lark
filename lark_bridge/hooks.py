@@ -53,11 +53,16 @@ def _on_sigterm(signum, frame):
     raise HookTerminated()
 
 
-def _commit_final(sid, offset) -> None:
-    """进入"必须交出结果"阶段：先让 SIGTERM 只记录，再 commit（offset 为 None 则不 commit）。"""
+def _commit_final(sid, offset: int) -> None:
+    """进入"必须交出结果"阶段：先让 SIGTERM 只记录，再 commit 游标。"""
     _term["defer"] = True
-    if offset is not None:
-        state.commit_cursor(sid, offset)
+    state.commit_cursor(sid, offset)
+
+
+def _consume_final(sid, message_ids) -> None:
+    """同 _commit_final，但按 message_id 消费（回复不一定在游标处）。"""
+    _term["defer"] = True
+    state.consume(sid, message_ids)
 
 
 def wait_seconds() -> int:
@@ -65,23 +70,20 @@ def wait_seconds() -> int:
 
 
 class Peeked(list):
-    """peek 到的消息列表（文件顺序），附带 commit 用的偏移。
-
-    offset 是全部消息之后的偏移；ends[i] 是第 i 条消息所在行结束处的偏移。"""
+    """peek 到的消息列表（文件顺序），附带 commit 用的偏移。"""
 
     offset: int = 0
-    ends: tuple = ()
 
 
-def wait_for_messages(sid, deadline: float, now, sleep):
-    """每 POLL_SECONDS 秒 peek 一次。有消息 → 返回 Peeked（不 commit）；
-    到 deadline 或桥接被关闭 → 返回 None。SIGTERM 时 HookTerminated 向上抛出。"""
+def wait_for_messages(sid, deadline: float, now, sleep, since: int = 0):
+    """每 POLL_SECONDS 秒 peek 一次（只看收件箱里 since 偏移之后到达的消息）。
+    有消息 → 返回 Peeked（不 commit）；到 deadline 或桥接被关闭 → 返回 None。
+    SIGTERM 时 HookTerminated 向上抛出。"""
     while True:
-        entries, offset = state.peek_inbox_entries(sid)
-        if entries:
-            out = Peeked(m for m, _ in entries)
+        msgs, offset = state.peek_inbox(sid, since)
+        if msgs:
+            out = Peeked(msgs)
             out.offset = offset
-            out.ends = [e for _, e in entries]
             return out
         t = now()
         if t >= deadline or not state.is_enabled(sid):
@@ -99,18 +101,6 @@ def _sort_key(m):
 def _create_order(msgs):
     """按 create_time 排序的下标（稳定）。"""
     return sorted(range(len(msgs)), key=lambda i: _sort_key(msgs[i]))
-
-
-def _prefix_end(msgs, done):
-    """done 里的下标在文件顺序上能连成的最长前缀的结束偏移；没有则 None。
-
-    游标只能 commit 前缀，所以文件里排在前面、还没处理的消息不能被跳过。"""
-    end = None
-    for i in range(len(msgs)):
-        if i not in done:
-            break
-        end = msgs.ends[i]
-    return end
 
 
 def _text(m) -> str:
@@ -174,23 +164,29 @@ def _permission(sid, data, binding, start, now, sleep) -> str:
     tool_input = data.get("tool_input")
     if not isinstance(tool_input, dict):
         raise ValueError(f"permission: tool_input is {type(tool_input).__name__}")
+    # 只有提示发出之后才到达的消息算回复；之前积压的留给 Stop hook
+    since = state.inbox_size(sid)
     feishu.send(chat, format_permission(str(data.get("tool_name")), tool_input))
     deadline = start + wait_seconds()
     try:
         while True:
-            msgs = wait_for_messages(sid, deadline, now, sleep)
+            msgs = wait_for_messages(sid, deadline, now, sleep, since)
             if msgs is None:
                 if state.is_enabled(sid):
                     feishu.send(chat, MSG_PERM_TIMEOUT)
                 return ""
-            done = set()
+            done = []
             for i in _create_order(msgs):
-                done.add(i)
+                done.append(msgs[i].get("message_id"))
                 verdict = parse_permission(_text(msgs[i]))
                 if verdict is None:
                     continue
-                _commit_final(sid, _prefix_end(msgs, done))
-                feishu.send(chat, MSG_ALLOWED if verdict is True else MSG_DENIED)
+                _consume_final(sid, done)
+                feishu.send(
+                    chat,
+                    MSG_ALLOWED if verdict is True else MSG_DENIED,
+                    timeout=SHORT_SEND_TIMEOUT,
+                )
                 decision = {"behavior": "allow"}
                 if verdict is not True:
                     decision = {"behavior": "deny", "message": DENY_MESSAGE}
@@ -204,7 +200,7 @@ def _permission(sid, data, binding, start, now, sleep) -> str:
                     ensure_ascii=False,
                 )
             # 整批都不是明确的同意/拒绝：消费掉，提示后继续等
-            state.commit_cursor(sid, msgs.offset)
+            state.consume(sid, done)
             feishu.send(chat, MSG_PERM_HINT)
     except HookTerminated:
         # 用户在终端处理了确认框
@@ -225,16 +221,17 @@ def _ask(sid, data, binding, start, now, sleep) -> str:
         )
     ):
         raise ValueError("ask: malformed tool_input.questions")
+    since = state.inbox_size(sid)
     feishu.send(chat, format_questions(questions))
     try:
-        msgs = wait_for_messages(sid, start + wait_seconds(), now, sleep)
+        msgs = wait_for_messages(sid, start + wait_seconds(), now, sleep, since)
         if msgs is None:
             if state.is_enabled(sid):
                 feishu.send(chat, MSG_ASK_HANDBACK)
             return ""
         first = _create_order(msgs)[0]
         answers = parse_answers(_text(msgs[first]), questions)
-        _commit_final(sid, _prefix_end(msgs, {first}))
+        _consume_final(sid, [msgs[first].get("message_id")])
     except HookTerminated:
         feishu.send(chat, MSG_ASK_HANDBACK, timeout=SHORT_SEND_TIMEOUT)
         return ""

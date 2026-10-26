@@ -102,20 +102,59 @@ def test_append_repairs_partial_trailing_line(lark_home):
     assert [m["message_id"] for m in msgs] == ["om_test_1", "om_test_3"]
 
 
-def test_peek_entries_gives_per_message_end_offsets(lark_home):
+def _add(i, text=None):
+    state.append_inbox(
+        SID, {"message_id": f"om_test_{i}", "text": text or f"m{i}", "create_time": i}
+    )
+
+
+def _texts(**kw):
+    return [m["text"] for m in state.peek_inbox(SID, **kw)[0]]
+
+
+def test_peek_since_skips_earlier_lines(lark_home):
+    _add(1)
+    boundary = state.inbox_size(SID)
+    _add(2)
+    assert _texts() == ["m1", "m2"]
+    assert _texts(since=boundary) == ["m2"]
+    assert state.inbox_size("00000000-0000-0000-0000-00000000dead") == 0
+
+
+def test_consume_non_prefix_then_commit_prunes(lark_home):
+    for i in (1, 2, 3, 4):
+        _add(i)
+    p = lark_home / "sessions" / SID / "consumed.txt"
+    state.consume(SID, ["om_test_2", "om_test_4"])
+    assert _texts() == ["m1", "m3"]
+    assert state._cursor(SID) == 0  # m1 not consumed: cursor can't move
+    _, off = state.peek_inbox(SID)
+    state.commit_cursor(SID, off)  # Stop delivered m1, m3
+    assert _texts() == []
+    assert not p.exists()  # all consumed ids passed by the cursor
+
+
+def test_consume_prefix_advances_cursor(lark_home):
     for i in (1, 2, 3):
-        state.append_inbox(
-            SID, {"message_id": f"om_test_{i}", "text": "é" * i, "create_time": i}
-        )
-    p = lark_home / "sessions" / SID / "inbox.jsonl"
-    with open(p, "ab") as f:
+        _add(i)
+    with open(lark_home / "sessions" / SID / "inbox.jsonl", "ab") as f:
         f.write(b"not json\n")
-    entries, off = state.peek_inbox_entries(SID)
-    assert [m["text"] for m, _ in entries] == ["é", "éé", "ééé"]
-    assert off == p.stat().st_size == state.peek_inbox(SID)[1]
-    # committing the 2nd message's end leaves exactly the 3rd
-    state.commit_cursor(SID, entries[1][1])
-    rest, _ = state.peek_inbox(SID)
-    assert [m["text"] for m in rest] == ["ééé"]
-    entries2, _ = state.peek_inbox_entries(SID)
-    assert entries2[0][1] == entries[2][1]
+    _add(4)
+    state.consume(SID, ["om_test_1", "om_test_2"])
+    assert _texts() == ["m3", "m4"]
+    first_end = len(
+        (lark_home / "sessions" / SID / "inbox.jsonl").read_bytes().split(b"\n")[0]
+    )
+    assert state._cursor(SID) > first_end
+    state.consume(SID, ["om_test_3"])  # also skips the garbage line
+    assert _texts() == ["m4"]
+    assert state._consumed(SID) == set()
+    state.consume(SID, ["om_test_4"])
+    size = state.inbox_size(SID)
+    assert state._cursor(SID) == size and _texts() == []
+
+
+def test_consume_non_string_id(lark_home):
+    state.append_inbox(SID, {"message_id": 7, "text": "x", "create_time": 1})
+    state.consume(SID, [7])
+    assert _texts() == []

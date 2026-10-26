@@ -4,7 +4,12 @@ import signal
 import pytest
 
 from lark_bridge import feishu, hooks, state
-from lark_bridge.text import DELIVER_PREFIX, format_permission, format_questions
+from lark_bridge.text import (
+    DELIVER_PREFIX,
+    JOIN_SEP,
+    format_permission,
+    format_questions,
+)
 from test_hooks_stop import (  # noqa: F401 - fixtures
     SID,
     Clock,
@@ -101,8 +106,7 @@ def test_permission_allow(bridged):
 
 @pytest.mark.parametrize("word", ["1", "OK", "允许。", " yes "])
 def test_permission_allow_words(bridged, word):
-    state.append_inbox(SID, msg(1, word, "1"))
-    clock = Clock()
+    clock = Clock(arrive((1, msg(1, word, "1"))))
     assert (
         json.loads(hooks.run("permission", perm_input(), clock.now, clock.sleep))
         == ALLOW
@@ -142,22 +146,26 @@ def test_permission_ambiguous_is_committed_before_decision(bridged):
     assert seen == [[]]  # "好的吧" consumed while still waiting
 
 
-def test_permission_leaves_later_messages_for_stop(bridged):
-    state.append_inbox(SID, msg(2, "顺便把测试也跑了", "300"))
-    state.append_inbox(SID, msg(1, "同意", "200"))  # earlier create_time
-    clock = Clock()
+def test_permission_out_of_order_consumes_only_the_answer(bridged):
+    clock = Clock(
+        arrive(
+            (1, msg(2, "顺便把测试也跑了", "300")),
+            (1, msg(1, "同意", "200")),  # earlier create_time, later in file
+        )
+    )
     out = hooks.run("permission", perm_input(), clock.now, clock.sleep)
     assert json.loads(out) == ALLOW
-    # file order is [later, 同意]; the cursor can only commit a prefix, so the
-    # later message must not be skipped
-    assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["顺便把测试也跑了", "同意"]
+    assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["顺便把测试也跑了"]
 
 
 def test_permission_commits_only_up_to_deciding_message(bridged):
-    state.append_inbox(SID, msg(1, "嗯？", "100"))
-    state.append_inbox(SID, msg(2, "同意", "200"))
-    state.append_inbox(SID, msg(3, "然后部署", "300"))
-    clock = Clock()
+    clock = Clock(
+        arrive(
+            (1, msg(1, "嗯？", "100")),
+            (1, msg(2, "同意", "200")),
+            (1, msg(3, "然后部署", "300")),
+        )
+    )
     out = hooks.run("permission", perm_input(), clock.now, clock.sleep)
     assert json.loads(out) == ALLOW
     assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["然后部署"]
@@ -166,12 +174,60 @@ def test_permission_commits_only_up_to_deciding_message(bridged):
 
 
 def test_permission_first_decision_wins(bridged):
-    state.append_inbox(SID, msg(1, "拒绝", "100"))
-    state.append_inbox(SID, msg(2, "同意", "200"))
-    clock = Clock()
+    clock = Clock(arrive((1, msg(1, "拒绝", "100")), (1, msg(2, "同意", "200"))))
     out = hooks.run("permission", perm_input(), clock.now, clock.sleep)
     assert json.loads(out) == DENY
     assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["同意"]
+
+
+def test_permission_ignores_replies_sent_before_prompt(bridged):
+    state.append_inbox(SID, msg(1, "1", "100"))  # backlog, meant for something else
+    clock = Clock(arrive((3, msg(2, "拒绝", "200"))))
+    out = hooks.run("permission", perm_input(), clock.now, clock.sleep)
+    assert json.loads(out) == DENY
+    assert clock.sleeps >= 3  # kept waiting despite the queued "1"
+    assert "请回复「同意」或「拒绝」" not in sent_texts(bridged())
+    # the early "1" is still delivered, once, by the next Stop hook
+    out = hooks.run("stop", stop_input(None), clock.now, clock.sleep)
+    assert json.loads(out)["reason"] == DELIVER_PREFIX + "1"
+    assert state.peek_inbox(SID)[0] == []
+    assert not (state.paths.home() / "sessions" / SID / "consumed.txt").exists()
+
+
+def test_permission_backlog_only_times_out(bridged, monkeypatch):
+    monkeypatch.setenv("CLAUDE_LARK_WAIT_SECONDS", "2")
+    state.append_inbox(SID, msg(1, "同意", "100"))
+    clock = Clock()
+    assert hooks.run("permission", perm_input(), clock.now, clock.sleep) == ""
+    assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["同意"]
+
+
+def test_non_prefix_consumption_no_loss_no_duplicate(bridged):
+    # file: a (backlog), 嗯 (ambiguous), b, 同意. The hook consumes 嗯 and 同意,
+    # which are not a prefix of the file; Stop must deliver exactly a, b.
+    state.append_inbox(SID, msg(1, "a", "100"))
+
+    def on_sleep(c):
+        if c.sleeps == 1:
+            state.append_inbox(SID, msg(2, "嗯", "200"))
+        if c.sleeps == 3:
+            # "b" lands first in the file but was sent after "同意"
+            state.append_inbox(SID, msg(3, "b", "500"))
+            state.append_inbox(SID, msg(4, "同意", "400"))
+
+    clock = Clock(on_sleep)
+    out = hooks.run("permission", perm_input(), clock.now, clock.sleep)
+    assert json.loads(out) == ALLOW
+    assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["a", "b"]
+    clock2 = Clock()
+    out = hooks.run("stop", stop_input(None), clock2.now, clock2.sleep)
+    assert json.loads(out)["reason"] == DELIVER_PREFIX + "a" + JOIN_SEP + "b"
+    assert state.peek_inbox(SID)[0] == []
+    assert not (state.paths.home() / "sessions" / SID / "consumed.txt").exists()
+    # a new message after everything is delivered exactly once
+    state.append_inbox(SID, msg(5, "c", "500"))
+    out = hooks.run("stop", stop_input(None), clock2.now, clock2.sleep)
+    assert json.loads(out)["reason"] == DELIVER_PREFIX + "c"
 
 
 def test_permission_timeout_returns_empty(bridged, monkeypatch):
@@ -220,13 +276,11 @@ def test_permission_exception_never_allows(bridged, monkeypatch):
 
 
 def test_permission_commit_failure_never_allows(bridged, monkeypatch):
-    state.append_inbox(SID, msg(1, "同意", "1"))
-
     def boom(*a, **k):
         raise OSError("disk full")
 
-    monkeypatch.setattr(hooks.state, "commit_cursor", boom)
-    clock = Clock()
+    monkeypatch.setattr(hooks.state, "consume", boom)
+    clock = Clock(arrive((1, msg(1, "同意", "1"))))
     assert hooks.run("permission", perm_input(), clock.now, clock.sleep) == ""
     assert "✅ 已允许" not in sent_texts(bridged())
 
@@ -239,8 +293,7 @@ def test_permission_bad_tool_input_never_allows(bridged):
 
 
 def test_permission_non_bash_tool(bridged):
-    state.append_inbox(SID, msg(1, "y", "1"))
-    clock = Clock()
+    clock = Clock(arrive((1, msg(1, "y", "1"))))
     ti = {"file_path": "/work/a.py", "content": "x"}
     out = hooks.run("permission", perm_input("Write", ti), clock.now, clock.sleep)
     assert json.loads(out) == ALLOW
@@ -258,20 +311,21 @@ def test_permission_disabled_while_waiting(bridged):
 
 
 def _sigterm_after_commit(monkeypatch):
-    real = state.commit_cursor
+    """Fire SIGTERM right after the reply is consumed (cursor or by id)."""
+    for name in ("commit_cursor", "consume"):
+        real = getattr(state, name)
 
-    def commit_then_sigterm(sid, offset):
-        real(sid, offset)
-        hooks._on_sigterm(signal.SIGTERM, None)
+        def then_sigterm(*a, _real=real, **k):
+            _real(*a, **k)
+            hooks._on_sigterm(signal.SIGTERM, None)
 
-    monkeypatch.setattr(hooks.state, "commit_cursor", commit_then_sigterm)
+        monkeypatch.setattr(hooks.state, name, then_sigterm)
 
 
 def test_permission_sigterm_after_commit_keeps_result(bridged, monkeypatch):
     # M1: once the reply is consumed, the decision must not be dropped
-    state.append_inbox(SID, msg(1, "同意", "1"))
     _sigterm_after_commit(monkeypatch)
-    clock = Clock()
+    clock = Clock(arrive((1, msg(1, "同意", "1"))))
     out = hooks.run("permission", perm_input(), clock.now, clock.sleep)
     assert json.loads(out) == ALLOW
     assert sent_texts(bridged())[-1] == "✅ 已允许"
@@ -308,8 +362,7 @@ def test_ask_free_text_and_multi_question(bridged):
             "multiSelect": True,
         }
     ]
-    state.append_inbox(SID, msg(1, "紫色\n1,3", "1"))
-    clock = Clock()
+    clock = Clock(arrive((1, msg(1, "紫色\n1,3", "1"))))
     out = json.loads(hooks.run("ask", ask_input(qs), clock.now, clock.sleep))
     assert out["hookSpecificOutput"]["updatedInput"]["answers"] == {
         "Which color?": "紫色",
@@ -318,9 +371,7 @@ def test_ask_free_text_and_multi_question(bridged):
 
 
 def test_ask_uses_first_message_and_leaves_rest(bridged):
-    state.append_inbox(SID, msg(1, "1", "100"))
-    state.append_inbox(SID, msg(2, "另外改下标题", "200"))
-    clock = Clock()
+    clock = Clock(arrive((1, msg(1, "1", "100")), (1, msg(2, "另外改下标题", "200"))))
     out = json.loads(hooks.run("ask", ask_input(), clock.now, clock.sleep))
     assert out["hookSpecificOutput"]["updatedInput"]["answers"] == {
         "Which color?": "Red"
@@ -347,6 +398,16 @@ def test_ask_sigterm_returns_empty(bridged):
     assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["1"]
 
 
+def test_ask_ignores_messages_sent_before_prompt(bridged):
+    state.append_inbox(SID, msg(1, "1", "100"))
+    clock = Clock(arrive((2, msg(2, "2", "200"))))
+    out = json.loads(hooks.run("ask", ask_input(), clock.now, clock.sleep))
+    assert out["hookSpecificOutput"]["updatedInput"]["answers"] == {
+        "Which color?": "Blue"
+    }
+    assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["1"]
+
+
 def test_ask_bad_questions_returns_empty(bridged):
     state.append_inbox(SID, msg(1, "1", "1"))
     clock = Clock()
@@ -356,9 +417,8 @@ def test_ask_bad_questions_returns_empty(bridged):
 
 
 def test_ask_sigterm_after_commit_keeps_result(bridged, monkeypatch):
-    state.append_inbox(SID, msg(1, "2", "1"))
     _sigterm_after_commit(monkeypatch)
-    clock = Clock()
+    clock = Clock(arrive((1, msg(1, "2", "1"))))
     out = json.loads(hooks.run("ask", ask_input(), clock.now, clock.sleep))
     assert out["hookSpecificOutput"]["updatedInput"]["answers"] == {
         "Which color?": "Blue"
