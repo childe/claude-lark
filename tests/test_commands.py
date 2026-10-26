@@ -225,7 +225,9 @@ def test_cli_slash_and_on(fake, lark_home):
         env=env,
     )
     try:
-        assert r.returncode == 0 and r.stdout.startswith("RESULT: 已开启桥接")
+        # 测试进程树里没有 claude，应拒绝开启；有就正常开启
+        assert r.returncode == 0
+        assert r.stdout.startswith(("RESULT: 已开启桥接", "RESULT: 未能识别 claude"))
     finally:
         pid = listener._read_pid()
         if pid:
@@ -240,3 +242,63 @@ def test_cli_bad_session_never_raises(lark_home):
         env=dict(os.environ),
     )
     assert r.returncode == 0 and r.stdout.startswith("RESULT: 出错了：")
+
+
+def test_slash_refuses_without_claude_pid(fake, monkeypatch, lark_home):
+    monkeypatch.setattr(commands.procs, "find_claude_ancestor", lambda: None)
+    out = commands.slash(SID, "新群")
+    assert out.startswith("RESULT: 未能识别 claude 进程") and "doctor" in out
+    assert not [c for c in fake() if c[:2] == ["im", "+chat-create"]]
+    assert state.load_binding(SID) is None and not state.is_enabled(SID)
+    assert "find_claude_ancestor" in (lark_home / "errors.log").read_text()
+    bind(SID)
+    assert commands.slash(SID, "").startswith("RESULT: 未能识别")
+    assert not state.is_enabled(SID)
+    assert commands.slash(SID2, "oc_test_other").startswith("RESULT: 未能识别")
+
+
+def test_url_is_never_a_group_name(fake):
+    out = commands.slash(SID, "https://example.larksuite.com/chat/abc")
+    assert out.startswith("RESULT:") and "oc_" in out
+    assert fake() == [] and state.load_binding(SID) is None
+
+
+def test_binding_saved_even_if_enable_fails(fake, monkeypatch):
+    def boom():
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(listener, "ensure_running", boom)
+    assert commands.slash(SID, "g").startswith("RESULT: 出错了")
+    assert state.load_binding(SID).chat_id == "oc_test_chat"
+
+
+def test_bind_existing_occupied_skips_network(fake):
+    bind(SID2, chat="oc_test_other", pid=os.getpid(), enable=True)
+    commands.slash(SID, "oc_test_other")
+    assert not [c for c in fake() if c[:2] == ["im", "+chat-members-list"]]
+
+
+def test_off_twice_sends_once(fake):
+    bind(SID, enable=True)
+    commands.slash(SID, "off")
+    commands.slash(SID, "off")
+    assert len(sent(fake)) == 1
+
+
+def test_find_claude_ancestor_recognises_node(monkeypatch):
+    from lark_bridge import procs
+
+    table = {
+        os.getppid(): ("500", "zsh", ""),
+        500: ("600", "/usr/bin/node", "node /x/@anthropic-ai/claude-code/cli.js"),
+    }
+
+    def ps(field, pid):
+        ppid, comm, args = table[pid]
+        return args if field == "args" else f"{ppid} {comm}"
+
+    monkeypatch.setattr(procs, "_ps", ps)
+    assert procs.find_claude_ancestor() == 500
+    table[500] = ("600", "/usr/bin/node", "node /x/server.js")
+    table[600] = ("1", "launchd", "")
+    assert procs.find_claude_ancestor() is None
