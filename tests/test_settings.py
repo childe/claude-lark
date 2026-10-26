@@ -267,3 +267,60 @@ def test_doctor_never_writes_to_feishu(monkeypatch, tmp_path, lark_home, capsys)
             or argv[:2] == ["auth", "status"]
             or (argv[:2] == ["event", "consume"] and "--dry-run" in argv)
         ), argv
+
+
+def test_apply_keeps_symlink_and_mode(tmp_path):
+    import os
+
+    real = tmp_path / "dotfiles" / "settings.json"
+    real.parent.mkdir()
+    real.write_text("{}")
+    os.chmod(real, 0o600)
+    link = tmp_path / "settings.json"
+    link.symlink_to(real)
+    settings.apply("merge", link)
+    assert link.is_symlink()
+    assert json.loads(real.read_text()) == settings.merge({})
+    assert (real.stat().st_mode & 0o777) == 0o600
+    assert not [f for f in real.parent.iterdir() if ".tmp" in f.name]
+    settings.apply("remove", link)
+    assert link.is_symlink() and json.loads(real.read_text()) == {}
+
+
+def test_backups_in_same_second_do_not_collide(tmp_path):
+    p = tmp_path / "settings.json"
+    p.write_text("{}")
+    for _ in range(3):
+        settings.apply("merge", p)
+        settings.apply("remove", p)
+    assert len([f for f in tmp_path.iterdir() if ".bak." in f.name]) == 6
+
+
+def test_odd_shapes_raise_settings_error(tmp_path):
+    import pytest
+
+    for bad in (
+        {"env": []},
+        {"hooks": []},
+        {"hooks": {"Stop": {}}},
+        {"hooks": {"Stop": ["x"]}},
+        {"hooks": {"Stop": [{"hooks": {}}]}},
+    ):
+        for fn in (settings.merge, settings.remove):
+            with pytest.raises(settings.SettingsError):
+                fn(bad)
+    p = tmp_path / "settings.json"
+    p.write_text('{"env": []}')
+    with pytest.raises(settings.SettingsError):
+        settings.apply("merge", p)
+    assert p.read_text() == '{"env": []}'
+    assert len(list(tmp_path.iterdir())) == 1
+
+
+def test_has_hooks_checks_matcher():
+    cfg = settings.merge({})
+    cfg["hooks"]["PreToolUse"][0]["matcher"] = "*"
+    assert not settings.has_hooks(cfg)
+    cfg = settings.merge({})
+    cfg["hooks"]["PermissionRequest"][0]["matcher"] = "Bash"
+    assert not settings.has_hooks(cfg)

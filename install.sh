@@ -17,28 +17,27 @@ python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' \
 command -v "$LARK_CLI" >/dev/null 2>&1 || [ -x "$LARK_CLI" ] \
   || die "找不到 lark-cli，请先安装：npm i -g @larksuite/cli"
 
-# 2. 目录与软链接
+# 2. 先做完所有校验，任何一项不过就中止，不留下任何残留
 if [ -e "$LARK_DIR/app" ] && [ ! -L "$LARK_DIR/app" ]; then
   die "$LARK_DIR/app 已存在且不是软链接，请先移走它再重试"
 fi
-mkdir -p "$LARK_DIR" "$CMD_DIR"
-
-# 3. 先检查 settings.json 能否解析（非法 JSON 时中止，不改动任何东西）
+if [ -e "$CMD_DIR/lark.md" ] && [ ! -L "$CMD_DIR/lark.md" ]; then
+  die "$CMD_DIR/lark.md 已存在且不是软链接，请先移走它再重试"
+fi
 cd "$REPO"
 python3 -c '
 import sys
 from lark_bridge import settings
 try:
-    settings.load(settings.settings_path())
+    settings.merge(settings.load(settings.settings_path()))
 except settings.SettingsError as e:
     print("❌ " + str(e), file=sys.stderr)
     sys.exit(1)
 '
 
+# 3. 目录与软链接
+mkdir -p "$LARK_DIR" "$CMD_DIR"
 ln -sfn "$REPO" "$LARK_DIR/app"
-if [ -e "$CMD_DIR/lark.md" ] && [ ! -L "$CMD_DIR/lark.md" ]; then
-  die "$CMD_DIR/lark.md 已存在且不是软链接，请先移走它再重试"
-fi
 ln -sf "$LARK_DIR/app/commands/lark.md" "$CMD_DIR/lark.md"
 
 # 4. 合并 settings.json（自动备份；已有的无关配置原样保留）

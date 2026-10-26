@@ -14,6 +14,18 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 LARK_DIR="${CLAUDE_LARK_HOME:-$HOME/.claude/lark}"
 LINK_DIR="$HOME/.claude/lark"
 
+# 0. 先校验 settings.json；解析不了就中止，不做任何改动
+cd "$REPO"
+python3 -c '
+import sys
+from lark_bridge import settings
+try:
+    settings.remove(settings.load(settings.settings_path()))
+except settings.SettingsError as e:
+    print("❌ " + str(e), file=sys.stderr)
+    sys.exit(1)
+'
+
 # 1. 关掉所有会话的桥接：删 enabled 文件，再停监听进程
 if [ -d "$LARK_DIR/sessions" ]; then
   find "$LARK_DIR/sessions" -mindepth 2 -maxdepth 2 -name enabled -type f -exec rm -f {} +
@@ -28,7 +40,6 @@ if [ -f "$LARK_DIR/listener.pid" ]; then
 fi
 
 # 2. 从 settings.json 里移除本项目的 hooks（自动备份）
-cd "$REPO"
 python3 -c '
 from lark_bridge import settings
 print(settings.apply("remove"))

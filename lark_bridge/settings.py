@@ -29,6 +29,30 @@ class SettingsError(Exception):
     pass
 
 
+def _validate(cfg) -> None:
+    """形状不对（用户手改过）就抛 SettingsError，让调用方干净地中止。"""
+    if not isinstance(cfg, dict):
+        raise SettingsError("settings.json 的顶层不是 JSON 对象")
+    env = cfg.get("env")
+    if env is not None and not isinstance(env, dict):
+        raise SettingsError('settings.json 里的 "env" 不是对象，请先修好再重试')
+    hooks = cfg.get("hooks")
+    if hooks is None:
+        return
+    if not isinstance(hooks, dict):
+        raise SettingsError('settings.json 里的 "hooks" 不是对象，请先修好再重试')
+    for event, groups in hooks.items():
+        if not isinstance(groups, list):
+            raise SettingsError(
+                f"settings.json 里 hooks.{event} 不是数组，请先修好再重试"
+            )
+        for g in groups:
+            if not isinstance(g, dict) or not isinstance(g.get("hooks", []), list):
+                raise SettingsError(
+                    f"settings.json 里 hooks.{event} 的条目格式不对，请先修好再重试"
+                )
+
+
 def _is_ours(hook) -> bool:
     return isinstance(hook, dict) and _PATH_MARK in str(hook.get("command", ""))
 
@@ -67,6 +91,7 @@ def _strip(cfg: dict) -> bool:
 
 
 def merge(cfg: dict) -> dict:
+    _validate(cfg)
     out = copy.deepcopy(cfg)
     _strip(out)
     hooks = out.setdefault("hooks", {})
@@ -88,6 +113,7 @@ def merge(cfg: dict) -> dict:
 
 
 def remove(cfg: dict) -> dict:
+    _validate(cfg)
     out = copy.deepcopy(cfg)
     _strip(out)
     env = out.get("env")
@@ -103,10 +129,12 @@ def has_hooks(cfg: dict) -> bool:
     hooks = cfg.get("hooks") if isinstance(cfg, dict) else None
     if not isinstance(hooks, dict):
         return False
-    for event, _m, sub, _t in _ENTRIES:
+    for event, matcher, sub, _t in _ENTRIES:
         found = False
         for g in hooks.get(event) or []:
-            for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
+            if not isinstance(g, dict) or g.get("matcher") != matcher:
+                continue
+            for h in g.get("hooks") or []:
                 if _is_ours(h) and str(h.get("command", "")).endswith(f"hook {sub}"):
                     found = True
         if not found:
@@ -133,23 +161,32 @@ def load(path: Path) -> dict:
 
 def apply(action: str, path=None) -> str:
     """读 → 备份 → merge/remove → 写回。返回给用户看的一行说明。
-    出错（含 JSON 非法）时不改动任何文件。"""
+    出错（含 JSON 非法）时不改动任何文件。settings.json 是软链接时写到真实目标，
+    保持软链接和文件权限不变。"""
     path = Path(path) if path else settings_path()
     fn = {"merge": merge, "remove": remove}[action]
     cfg = load(path)
     new = fn(cfg)
+    target = path.resolve()
     if path.exists():
         if new == cfg:
             return f"{path} 无需改动"
-        bak = path.with_name(f"{path.name}.bak.{time.strftime('%Y%m%d%H%M%S')}")
+        stamp = f"{time.strftime('%Y%m%d%H%M%S')}.{time.time_ns() % 10**9:09d}"
+        bak = path.with_name(f"{path.name}.bak.{stamp}.{os.getpid()}")
         shutil.copy2(path, bak)
         note = f"（已备份到 {bak}）"
     else:
         if action == "remove":
             return f"{path} 不存在，无需改动"
-        path.parent.mkdir(parents=True, exist_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
         note = "（新建）"
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(new, indent=2, ensure_ascii=False) + "\n", "utf-8")
-    os.replace(tmp, path)
+    tmp = target.with_name(target.name + f".tmp.{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(new, indent=2, ensure_ascii=False) + "\n", "utf-8")
+        if target.exists():
+            shutil.copymode(target, tmp)
+        os.replace(tmp, target)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
     return f"已更新 {path} {note}"
