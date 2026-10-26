@@ -6,11 +6,13 @@
 - $FAKE_LARK_FAIL=1 时打印错误并以 1 退出。
 - im +chat-create → {"data":{"chat_id":"oc_test_chat"}}
 - auth status → owner ou_test_owner
-- event consume → 逐行输出 $FAKE_LARK_EVENTS 的内容，然后阻塞。
+- event consume → 逐行输出 $FAKE_LARK_EVENTS 的内容，然后阻塞；
+  $FAKE_LARK_IGNORE_TERM=1 时忽略 SIGTERM。
 """
 
 import json
 import os
+import signal
 import sys
 import time
 
@@ -41,6 +43,8 @@ def main(argv):
             )
         )
     elif argv[:2] == ["event", "consume"]:
+        if os.environ.get("FAKE_LARK_IGNORE_TERM") == "1":
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
         events = os.environ.get("FAKE_LARK_EVENTS")
         if events and os.path.exists(events):
             with open(events) as f:

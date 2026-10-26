@@ -21,13 +21,16 @@ from .text import strip_mentions
 NOT_BRIDGED = "当前没有会话在桥接，回到电脑前在终端敲 /lark"
 OFF_REPLY = "已断开，终端里敲 /lark 可重新连接"
 UNSUPPORTED = "暂不支持该类型消息，请发文字"
+HANDLE_FAILED = "处理失败，请重发"
 NOTICE_INTERVAL = 600  # 同一个群的"没有会话在桥接"提示最多 10 分钟一次
 SEND_TIMEOUT = 10
 EVENT_KEY = "im.message.receive_v1"
 _TEXT_TYPES = {"text", "post"}
+KILL_GRACE = 5  # terminate 之后这么多秒读循环还没结束就 kill
 
 _notice_at = {}  # chat_id -> 上次发"没有会话"提示的时间
 _now = time.monotonic
+_owner_missing = {"logged": False}
 
 
 def _log(msg: str) -> None:
@@ -42,8 +45,8 @@ def _log(msg: str) -> None:
         pass
 
 
-def _reply(chat_id: str, text: str) -> None:
-    feishu.send(chat_id, text, timeout=SEND_TIMEOUT)
+def _reply(chat_id: str, text: str) -> bool:
+    return feishu.send(chat_id, text, timeout=SEND_TIMEOUT)
 
 
 def _clean_text(ev: dict) -> str:
@@ -67,8 +70,14 @@ def _load_owner():
     try:
         oid = json.loads(paths.config_file().read_text()).get("owner_open_id")
     except (OSError, ValueError, AttributeError):
-        return None
-    return oid if isinstance(oid, str) and oid else None
+        oid = None
+    if isinstance(oid, str) and oid:
+        _owner_missing["logged"] = False
+        return oid
+    if not _owner_missing["logged"]:
+        _owner_missing["logged"] = True
+        _log("owner_open_id missing in config.json; dropping all messages")
+    return None
 
 
 def handle_event(ev: dict, owner: str) -> None:
@@ -77,14 +86,28 @@ def handle_event(ev: dict, owner: str) -> None:
     chat_id = ev.get("chat_id")
     if not isinstance(chat_id, str) or not chat_id:
         return
+    try:
+        _route(ev, chat_id)
+    except Exception:
+        # 绑定者的消息不能悄悄丢：记日志并让他重发
+        _log(
+            f"handle_event failed for {ev.get('message_id')}: {traceback.format_exc()}"
+        )
+        try:
+            _reply(chat_id, HANDLE_FAILED)
+        except Exception:
+            _log(f"reply {HANDLE_FAILED} failed: {traceback.format_exc()}")
+
+
+def _route(ev: dict, chat_id: str) -> None:
     b = state.find_enabled_by_chat(chat_id)
     if b is None:
         if any(x.chat_id == chat_id for x in state.all_bindings()):
             last = _notice_at.get(chat_id)
             now = _now()
             if last is None or now - last >= NOTICE_INTERVAL:
-                _notice_at[chat_id] = now
-                _reply(chat_id, NOT_BRIDGED)
+                if _reply(chat_id, NOT_BRIDGED):
+                    _notice_at[chat_id] = now
         return
     mtype = ev.get("message_type")
     if mtype is not None and mtype not in _TEXT_TYPES:
@@ -160,6 +183,26 @@ def _release_pid_file() -> None:
         pass
 
 
+def _try_exit() -> bool:
+    """在 pid 锁里做退出决定，与 ensure_running 互斥。
+
+    先删 pid 文件再复查：若期间有会话开启（它的 ensure_running 看到了我们的 pid
+    而没拉起新进程），就写回 pid 文件继续跑，返回 False；否则返回 True，调用方退出。"""
+    with _pid_lock():
+        if _read_pid() != os.getpid():
+            return True  # pid 文件不归我们（被别人接管），直接退出
+        pidf = paths.listener_pid_file()
+        try:
+            pidf.unlink()
+        except FileNotFoundError:
+            pass
+        if _any_enabled():
+            pidf.write_text(str(os.getpid()))
+            _log("session enabled during shutdown, keep running")
+            return False
+        return True
+
+
 def _any_enabled() -> bool:
     """顺手把 claude 进程已退出的会话关掉；返回是否还有开启中的会话。"""
     alive = False
@@ -211,7 +254,21 @@ def main(check_interval: float = 30, restart_delay: float = 5) -> int:
     def request_stop():
         stop.set()
         with lock:
-            _stop_child(cur["proc"])
+            proc = cur["proc"]
+            _stop_child(proc)
+        if proc is not None:
+            # 读循环 KILL_GRACE 秒后还没结束（子进程不理 SIGTERM）就升级为 kill
+            def escalate():
+                if proc.poll() is None:
+                    _log(f"lark-cli pid={proc.pid} ignored SIGTERM, killing")
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+
+            t = threading.Timer(KILL_GRACE, escalate)
+            t.daemon = True
+            t.start()
 
     def on_sigterm(signum, frame):
         _log("SIGTERM received")
@@ -226,14 +283,14 @@ def main(check_interval: float = 30, restart_delay: float = 5) -> int:
     def watchdog():
         while not stop.wait(check_interval):
             try:
-                if not _any_enabled():
+                if not _any_enabled() and _try_exit():
                     _log("no enabled sessions, exiting")
                     request_stop()
             except Exception:
                 _log(f"watchdog failed: {traceback.format_exc()}")
 
     try:
-        if not _any_enabled():
+        if not _any_enabled() and _try_exit():
             _log("no enabled sessions at start, exiting")
             return 0
         _log("listener started")
@@ -305,20 +362,23 @@ def main(check_interval: float = 30, restart_delay: float = 5) -> int:
 def ensure_running() -> None:
     """监听进程没在跑就在后台拉起一个。自身不抛出。"""
     try:
-        pid = _read_pid()
-        if pid is not None and procs.pid_alive(pid):
-            return
-        log = paths.listener_log()
-        log.parent.mkdir(parents=True, exist_ok=True)
-        script = Path(__file__).resolve().parent.parent / "bin" / "claude-lark"
-        with open(log, "a") as out:
-            subprocess.Popen(
-                [sys.executable, str(script), "listen"],
-                start_new_session=True,
-                stdin=subprocess.DEVNULL,
-                stdout=out,
-                stderr=out,
-                env=dict(os.environ),
-            )
+        # 与监听进程的退出决定（_try_exit）互斥：要么它看到我们刚开启的会话而留下，
+        # 要么我们看到 pid 文件已删而拉起新进程
+        with _pid_lock():
+            pid = _read_pid()
+            if pid is not None and procs.pid_alive(pid):
+                return
+            log = paths.listener_log()
+            log.parent.mkdir(parents=True, exist_ok=True)
+            script = Path(__file__).resolve().parent.parent / "bin" / "claude-lark"
+            with open(log, "a") as out:
+                subprocess.Popen(
+                    [sys.executable, str(script), "listen"],
+                    start_new_session=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=out,
+                    stderr=out,
+                    env=dict(os.environ),
+                )
     except Exception:
         feishu.log_exception("listener.ensure_running")

@@ -26,7 +26,9 @@ def fake(lark_home, tmp_path, monkeypatch):
     monkeypatch.delenv("FAKE_LARK_FAIL", raising=False)
     monkeypatch.delenv("FAKE_LARK_SLEEP", raising=False)
     monkeypatch.delenv("FAKE_LARK_EVENTS", raising=False)
+    monkeypatch.delenv("FAKE_LARK_IGNORE_TERM", raising=False)
     listener._notice_at.clear()
+    listener._owner_missing["logged"] = False
 
     def calls():
         if not log.exists():
@@ -356,3 +358,131 @@ def test_ensure_running_spawns_once(fake):
         except (OSError, ValueError):
             pass
     assert _wait(lambda: not pidf.exists())
+
+
+# ---------- fix round 1 ----------
+
+
+def test_listener_handler_error_asks_resend(fake, monkeypatch):
+    bind()
+
+    def boom(*a, **k):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(state, "append_inbox", boom)
+    listener.handle_event(ev(), "ou_test_owner")
+    assert sent_texts(fake()) == ["处理失败，请重发"]
+    assert "disk full" in paths.listener_log().read_text()
+    # 非绑定者的消息出错前就被丢弃，不回复
+    monkeypatch.setattr(state, "find_enabled_by_chat", boom)
+    listener.handle_event(ev(sender_id="ou_test_stranger"), "ou_test_owner")
+    assert len(sent_texts(fake())) == 1
+
+
+def test_listener_logs_missing_owner_once(fake, lark_home):
+    bind()
+    (lark_home / "config.json").write_text("{}")
+    listener._process_line(json.dumps(ev()))
+    listener._process_line(json.dumps(ev(message_id="om_test_2")))
+    assert paths.listener_log().read_text().count("owner_open_id missing") == 1
+    assert inbox() == []
+
+
+def test_listener_notice_retried_after_failed_send(fake, monkeypatch):
+    bind(enabled=False)
+    monkeypatch.setenv("FAKE_LARK_FAIL", "1")
+    listener.handle_event(ev(), "ou_test_owner")
+    monkeypatch.delenv("FAKE_LARK_FAIL")
+    listener.handle_event(ev(message_id="om_test_2"), "ou_test_owner")
+    listener.handle_event(ev(message_id="om_test_3"), "ou_test_owner")
+    sends = [c for c in fake() if c[:2] == ["im", "+messages-send"]]
+    assert len(sends) == 2  # 失败的一次 + 重试成功的一次，之后被限流
+
+
+def test_listener_keeps_running_if_enabled_during_shutdown(fake, monkeypatch):
+    """watchdog 已判定"没有会话"，在 pid 锁内复查前有会话开启 → 不退出。"""
+    bind()
+    script = [True, False, True]  # 启动检查 / watchdog 判定 / 锁内复查
+    default = {"v": True}
+
+    def fake_any_enabled():
+        return script.pop(0) if script else default["v"]
+
+    monkeypatch.setattr(listener, "_any_enabled", fake_any_enabled)
+    out = {}
+    th = threading.Thread(
+        target=lambda: out.setdefault(
+            "rc", listener.main(check_interval=0.1, restart_delay=0.1)
+        ),
+        daemon=True,
+    )
+    th.start()
+    try:
+        assert _wait(
+            lambda: paths.listener_log().exists()
+            and "keep running" in paths.listener_log().read_text()
+        )
+        time.sleep(0.3)
+        assert th.is_alive()
+        assert paths.listener_pid_file().read_text() == str(os.getpid())
+        kids = _child_pids()
+        assert len(kids) == 1 and procs.pid_alive(kids[0])
+    finally:
+        default["v"] = False
+        th.join(10)
+    assert not th.is_alive() and out["rc"] == 0
+    assert not paths.listener_pid_file().exists()
+
+
+def test_ensure_running_waits_for_pid_lock(fake, monkeypatch):
+    """ensure_running 与退出决定互斥：持锁期间它不能读 pid 文件、不能拉起。"""
+    spawned = []
+    monkeypatch.setattr(
+        listener.subprocess, "Popen", lambda *a, **k: spawned.append(a[0])
+    )
+    paths.listener_pid_file().write_text(str(os.getppid()))
+    with listener._pid_lock():
+        th = threading.Thread(target=listener.ensure_running)
+        th.start()
+        time.sleep(0.3)
+        assert th.is_alive() and spawned == []
+        # 模拟退出中的监听进程在锁内删掉 pid 文件
+        paths.listener_pid_file().unlink()
+    th.join(5)
+    assert len(spawned) == 1 and spawned[0][-1] == "listen"
+
+
+def test_listener_kills_child_ignoring_sigterm(fake, monkeypatch):
+    monkeypatch.setenv("FAKE_LARK_IGNORE_TERM", "1")
+    monkeypatch.setattr(listener, "KILL_GRACE", 0.3)
+    claude = subprocess.Popen(["sleep", "60"])
+    bind(claude_pid=claude.pid)
+
+    def killer():
+        _wait(lambda: _child_pids())
+        time.sleep(0.3)  # 让子进程装好 SIG_IGN
+        claude.kill()
+        claude.wait()
+
+    k = threading.Thread(target=killer)
+    k.start()
+    out = {}
+    th = threading.Thread(
+        target=lambda: out.setdefault(
+            "rc", listener.main(check_interval=0.1, restart_delay=0.1)
+        ),
+        daemon=True,
+    )
+    th.start()
+    th.join(4)
+    k.join()
+    alive = th.is_alive()
+    for pid in _child_pids():
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    th.join(5)
+    assert not alive, "read loop stayed blocked on a child ignoring SIGTERM"
+    assert out["rc"] == 0
+    assert "ignored SIGTERM" in paths.listener_log().read_text()

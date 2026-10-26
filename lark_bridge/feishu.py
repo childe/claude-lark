@@ -53,10 +53,10 @@ def _run(args, timeout=TIMEOUT) -> str:
     return r.stdout
 
 
-def send(chat_id: str, markdown: str, timeout: float = TIMEOUT) -> None:
+def send(chat_id: str, markdown: str, timeout: float = TIMEOUT) -> bool:
     """分段发送；任何失败只记 errors.log，不抛出。某段失败后不再发后续段。
 
-    timeout 是每一段的 lark-cli 超时秒数。"""
+    timeout 是每一段的 lark-cli 超时秒数。全部发出返回 True，否则 False。"""
     try:
         for part in split_message(markdown):
             _run(
@@ -72,10 +72,12 @@ def send(chat_id: str, markdown: str, timeout: float = TIMEOUT) -> None:
                 ],
                 timeout=timeout,
             )
+        return True
     except FeishuError as e:
         log_error(f"send to {chat_id}: {e}")
     except Exception:
         log_exception(f"send to {chat_id}")
+    return False
 
 
 def _json(out: str) -> dict:
