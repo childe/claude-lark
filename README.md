@@ -18,7 +18,7 @@ is the Python standard library only.
 ```
  terminal (claude)            hooks                    listener                 Feishu group
  ----------------        ---------------        ----------------------        ----------------
- /lark  -----------------> bind session  ----->  lark-cli event consume  <---- you (phone): "run the tests"
+ /lark  -----------------> bind session  ----->  polls the group as you <---- you (phone): "run the tests"
                            to a group            (one per machine)
  turn ends ------ Stop hook: send final reply ------------------------------> final reply
                        |    then wait for the next group message
@@ -37,8 +37,9 @@ claude-lark 把一个**正在运行**的 Claude Code 会话桥接到飞书群，
 - 群里发的消息进入同一个会话；每轮的最终回复发回群里；权限确认和选择题也转到群里，回"同意/拒绝"或编号即可。
 - 回到电脑前：先按 `Esc` 拿回终端，再 `/lark off` 停止同步（群里发 `/off` 也行）。
 - 安装：`git clone https://github.com/childe/claude-lark ~/.claude/lark-src && ~/.claude/lark-src/install.sh`，然后重启已经开着的 claude 会话。
-- 前置：Python ≥ 3.9、Claude Code ≥ 2.1.287、`lark-cli` ≥ 1.0.92，以及一个开了机器人能力、订阅了 `im.message.receive_v1`（长连接）的飞书自建应用。
-- 限制：同一个飞书应用的消息事件同一时刻只能被一个监听方消费；一次 `/lark` 之后最多连续约 1000 次 hook 阻塞（群消息回合和续命回合都算，终端里输入一次就清零）；resume 后不自动重连；不能从飞书远程启动 claude。
+- 前置：Python ≥ 3.9、Claude Code ≥ 2.1.287、`lark-cli` ≥ 1.0.92，以及一个开了机器人能力的飞书自建应用（不需要订阅事件）。
+- 收消息：监听进程以**你的 user 身份**每 2 秒拉一次已开启群的消息，不占用应用的事件长连接，所以同一个应用被别的后端订阅着也不影响。
+- 限制：一次 `/lark` 之后最多连续约 1000 次 hook 阻塞（群消息回合和续命回合都算，终端里输入一次就清零）；resume 后不自动重连；不能从飞书远程启动 claude。
 - 把仓库链接贴给你的 AI 助手说"帮我装"也可以，见 [For AI agents](#for-ai-agents)。
 
 ## Prerequisites
@@ -51,34 +52,29 @@ Check each item; the command and the expected result are given.
 | 2 | Python >= 3.9 | `python3 --version` | `Python 3.9.x` or newer |
 | 3 | Claude Code >= 2.1.287 | `claude --version` | `2.1.287` or newer |
 | 4 | `lark-cli` >= 1.0.92 | `npm i -g @larksuite/cli`, then `lark-cli --version` | `lark-cli version 1.0.92` or newer |
-| 5 | A Feishu/Lark self-built app (see below) | `lark-cli event consume im.message.receive_v1 --as bot --dry-run` | JSON where every entry of `preconditions` has `"status": "ok"` |
-| 6 | `lark-cli` logged in as both bot and user | `lark-cli auth status` | `identities.bot.status` and `identities.user.status` are both `ready` |
+| 5 | A Feishu/Lark self-built app with the bot capability (see below) | `lark-cli auth status` | `identities.bot.status` is `ready` |
+| 6 | `lark-cli` logged in as user, with the group-read scope | `lark-cli auth status` | `identities.user.status` is `ready` (or `needs_refresh`) and `identities.user.scope` contains `im:message.group_msg:get_as_user` |
+
+claude-lark does **not** subscribe to events. The listener reads the bound groups by polling
+`GET /open-apis/im/v1/messages` with your user identity every 2 seconds. Reason: Feishu delivers each
+event to only one of the connections of an app, so if another backend already holds a long
+connection for the same app, an event consumer here would silently miss most messages.
 
 ### The Feishu/Lark app (done once, by a human, in the developer console)
 
 1. Create a self-built app in the Feishu Open Platform developer console, and **enable the Bot capability**.
-2. Give it the permissions (scopes) below. The list was derived from the real CLI: `lark-cli event schema im.message.receive_v1` (Required Scopes) and the `lark-cli skills read lark-im/...` reference pages of the commands claude-lark calls.
+2. Give it the permissions (scopes) below.
 
-   | Scope | Why it is needed |
-   |-------|------------------|
-   | `im:message.p2p_msg:readonly` | Required by `im.message.receive_v1` (printed by `lark-cli event schema im.message.receive_v1`). |
-   | A group-message receive scope, see warning below | Receiving your messages in the group. |
-   | `im:message:send_as_bot` | `lark-cli im +messages-send --as bot`: replies, permission prompts, "connected" notices. |
-   | `im:chat:create` | `lark-cli im +chat-create --as bot`: `/lark` creates the group. |
-   | `im:chat.members:read` | `lark-cli im +chat-members-list --as bot`: `/lark oc_...` checks that the bot is in the group. |
-   | `im:chat:read` (optional) | `lark-cli im +chat-search`, only needed for the "find a chat_id by name" tip below. |
+   | Scope | Identity | Why it is needed |
+   |-------|----------|------------------|
+   | `im:message.group_msg:get_as_user` | user | The listener reads the bound groups' messages as you. |
+   | `im:message:send_as_bot` | bot | `lark-cli im +messages-send --as bot`: replies, permission prompts, "connected" notices. |
+   | `im:chat:create` | bot | `lark-cli im +chat-create --as bot`: `/lark` creates the group. |
+   | `im:chat.members:read` | bot | `lark-cli im +chat-members-list --as bot`: `/lark oc_...` checks that the bot is in the group. |
+   | `im:chat:read` (optional) | user | `lark-cli im +chat-search`, only needed for the "find a chat_id by name" tip below. |
 
-   > **Warning, not verified on a live group yet.** `im:message.p2p_msg:readonly` only covers
-   > one-to-one chats. To receive group messages that do **not** @ the bot, the app needs the
-   > "read all group messages" style permission (in the console it is listed as receiving all
-   > messages of the groups the bot is in). The exact scope name was not confirmed by the CLI and
-   > this path has not been exercised against a real group. If it is not available to your app,
-   > fall back to **@-mentioning the bot in every message** (the @-only group permission), and
-   > please report back what worked.
-
-3. Subscribe to the event **`im.message.receive_v1`**, using the **long connection** (WebSocket) mode, no public URL needed.
-4. **Create a version and publish the app** (scopes and events only take effect after publishing and, for a company tenant, admin approval).
-5. Run `lark-cli auth login` so that both the bot and the user identity are ready. The user identity is only used to find out who you are: only messages sent by that person are ever processed.
+3. **Create a version and publish the app** (scopes only take effect after publishing and, for a company tenant, admin approval). No event subscription is needed.
+4. Run `lark-cli auth login --scope im:message.group_msg:get_as_user` so that both the bot and the user identity are ready and the user token carries the read scope. The user identity is also how claude-lark knows who you are: only messages sent by that person are ever processed.
 
 Never paste the App ID, App Secret or tokens into a chat, an issue or a commit.
 
@@ -124,14 +120,14 @@ with a backup.
 
 3. **Check the Feishu login.** Run `lark-cli auth status`.
    Success: `identities.bot.status` and `identities.user.status` both `ready`.
-   On failure: **[HUMAN]** `lark-cli auth login` opens a browser or prints a link that the human must complete; if no app is configured yet, the human must first do the "Feishu/Lark app" section above (steps 1 to 4 in the developer console: enable the bot, add scopes, subscribe to `im.message.receive_v1` by long connection, publish). Stop and ask the human; resume once they confirm, then re-run `lark-cli auth status`.
+   On failure: **[HUMAN]** `lark-cli auth login` opens a browser or prints a link that the human must complete; if no app is configured yet, the human must first do the "Feishu/Lark app" section above (steps 1 to 3 in the developer console: enable the bot, add scopes, publish). Stop and ask the human; resume once they confirm, then re-run `lark-cli auth status`.
 
 4. **Install.** Run `~/.claude/lark-src/install.sh`.
    Success: exit code 0 and the last line says to restart running claude sessions. On failure: read the `❌` line; typical causes are a missing `python3`/`lark-cli` (go back to step 1), an existing non-symlink `~/.claude/lark/app` or `~/.claude/commands/lark.md` (ask the human before moving it away), an invalid `~/.claude/settings.json` (ask the human to fix the JSON; do not overwrite it), or not logged in (step 3).
 
 5. **Run doctor.** Run `~/.claude/lark/app/bin/claude-lark doctor`.
    Success: exit code 0 and the last line `全部通过`, every check line `✅`. On failure: for each `❌` line run the command in the `修复：` line that follows it, and re-run doctor until it is clean. Special cases:
-   - `事件订阅前置条件未通过` (event subscription preconditions failed): **[HUMAN]** in the developer console, publish the app, subscribe to `im.message.receive_v1` with the long connection, and grant the scopes from the table above. This cannot be done from the command line. Stop and ask the human; after they confirm, re-run doctor.
+   - `user 身份缺少读群消息权限` (user token lacks the group-read scope): **[HUMAN]** run `lark-cli auth login --scope im:message.group_msg:get_as_user` and complete the browser login. If the login reports the scope is not available, the human must first add it to the app in the developer console and publish a new version. Stop and ask the human; after they confirm, re-run doctor.
    - `owner 与当前登录用户不一致`: run `~/.claude/lark-src/install.sh` again.
    - A line about `settings.json` or `lark.md`: run `~/.claude/lark-src/install.sh` again.
 

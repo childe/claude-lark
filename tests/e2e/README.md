@@ -19,7 +19,7 @@ E2E_ONLY="2 3" tests/e2e/run_e2e.sh   # 只跑部分场景（场景 1 总会先�
   都改写成本仓库 `bin/claude-lark` 的绝对路径。
 - 状态目录 `CLAUDE_LARK_HOME`、假 `CLAUDE_LARK_CLI`、`FAKE_LARK_LOG`、`FAKE_LARK_EVENTS`、
   `CLAUDE_LARK_WAIT_SECONDS=20`、`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP=1000` 都通过 tmux 里 claude 的命令行环境变量传入。
-- 群消息：往 `FAKE_LARK_EVENTS` 追加一行事件 JSON；假 lark-cli 的 `event consume` 像 `tail -f` 一样跟随。
+- 群消息：往 `FAKE_LARK_EVENTS` 追加一行事件 JSON；假 lark-cli 把这个文件当作群消息记录，监听进程轮询 `api GET /open-apis/im/v1/messages` 时读到。
 - 唯一会写到真实 `~/.claude` 的是 Claude Code 自己记录的"信任此目录"和会话 transcript。
 
 ## 场景
