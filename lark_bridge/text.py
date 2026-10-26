@@ -66,12 +66,12 @@ def format_permission(tool_name: str, tool_input: dict) -> str:
         desc = tool_input.get("description")
         if desc:
             parts.append(str(desc))
-        parts.append("```\n" + str(tool_input.get("command", "")) + "\n```")
+        parts.append(fenced(str(tool_input.get("command", ""))))
     else:
         body = json.dumps(tool_input, ensure_ascii=False, indent=2)
         if len(body) > _JSON_LIMIT:
             body = body[:_JSON_LIMIT] + "\n…（已截断）"
-        parts = [f"Claude 想使用工具 {tool_name}：", "```\n" + body + "\n```"]
+        parts = [f"Claude 想使用工具 {tool_name}：", fenced(body)]
     parts.append(PERMISSION_FOOTER)
     return "\n".join(parts)
 
@@ -90,16 +90,42 @@ def format_questions(questions: list[dict]) -> str:
     return "\n\n".join(blocks)
 
 
-def _is_fence(line: str) -> bool:
-    return line.lstrip().startswith("```")
+_FENCE_OPEN = re.compile(r"[ \t]{0,3}(`{3,})")
+
+
+def fence_for(content: str) -> str:
+    """比内容里最长的一串反引号多一个（至少 3 个），内容里的 ``` 就关不掉它。"""
+    longest = max((len(r) for r in re.findall(r"`+", content)), default=0)
+    return "`" * max(3, longest + 1)
+
+
+def fenced(content: str) -> str:
+    f = fence_for(content)
+    return f"{f}\n{content}\n{f}"
+
+
+def _fence_step(open_fence, line: str):
+    """读入一行后的围栏状态：None 表示不在代码块里，否则是开代码块的那串反引号。"""
+    m = _FENCE_OPEN.match(line)
+    if open_fence is None:
+        return m.group(1) if m else None
+    # 关闭围栏：只有反引号，且不短于开围栏（CommonMark）
+    if m and len(m.group(1)) >= len(open_fence) and not line[m.end() :].strip():
+        return None
+    return open_fence
 
 
 def split_message(text: str, limit: int = 4000) -> list[str]:
-    """Split on newlines, keeping every part <= limit and code fences balanced."""
+    """Split on newlines, keeping every part <= limit and code fences balanced.
+
+    围栏可以比 3 个反引号长（见 fence_for）；分段处用同样长度的围栏关闭、重新打开。"""
     if len(text) <= limit:
         return [text]
-    # Room for a closing "\n```" plus an opening "```\n" around any piece.
-    max_piece = limit - 8
+    widest = max(
+        [3] + [len(m.group(1)) for m in map(_FENCE_OPEN.match, text.split("\n")) if m]
+    )
+    # 每段前后都可能要补一个 "<fence>\n" / "\n<fence>"
+    max_piece = max(1, limit - 2 * (widest + 1))
     pieces = []
     for line in text.split("\n"):
         while len(line) > max_piece:
@@ -109,19 +135,19 @@ def split_message(text: str, limit: int = 4000) -> list[str]:
 
     parts: list[str] = []
     cur = ""
-    fence = False  # inside a code block at the end of cur
+    fence = None  # 当前 cur 末尾所在代码块的围栏
     for piece in pieces:
-        new_fence = fence != _is_fence(piece)
+        new_fence = _fence_step(fence, piece)
         cand = cur + "\n" + piece if cur else piece
-        if len(cand) + (4 if new_fence else 0) <= limit:
+        if len(cand) + (len(new_fence) + 1 if new_fence else 0) <= limit:
             cur, fence = cand, new_fence
             continue
-        parts.append(cur + "\n```" if fence else cur)
-        cur = "```" if fence else ""
+        parts.append(cur + "\n" + fence if fence else cur)
+        cur = fence or ""
         cur = cur + "\n" + piece if cur else piece
-        fence = fence != _is_fence(piece)
+        fence = new_fence
     if cur:
-        parts.append(cur + "\n```" if fence else cur)
+        parts.append(cur + "\n" + fence if fence else cur)
     return parts
 
 

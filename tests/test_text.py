@@ -134,3 +134,50 @@ def test_constants():
     assert KEEPALIVE_REASON.startswith("（claude-lark 保活）")
     assert DELIVER_PREFIX == "以下是用户在飞书群里发来的消息：\n\n"
     assert text.JOIN_SEP == "\n\n---\n\n"
+
+
+# ---------------- final review: fences around content with backticks
+
+
+def _fence_lines(part):
+    return [ln for ln in part.split("\n") if ln.startswith("```")]
+
+
+def test_format_permission_fence_longer_than_backticks_in_command():
+    cmd = "cat <<'EOF' > a.md\n```python\nprint(1)\n```\nEOF"
+    s = format_permission("Bash", {"command": cmd, "description": "写文件"})
+    assert "````\n" + cmd + "\n````" in s
+    # 内容里的 ``` 不能提前关闭外层代码块：外层围栏只出现两次
+    assert [ln for ln in s.split("\n") if ln == "````"] == ["````", "````"]
+    s = format_permission("Bash", {"command": "echo `````x`````"})
+    assert "``````\necho `````x`````\n``````" in s
+    # 没有反引号时仍是 3 个
+    assert "```\nls\n```" in format_permission("Bash", {"command": "ls"})
+
+
+def test_format_permission_json_body_fence_longer_than_backticks():
+    s = format_permission("Write", {"content": "a\n```\nb"})
+    lines = s.split("\n")
+    assert lines[1] == "````" and "````" in lines[2:]
+
+
+def test_split_message_with_longer_fence_and_inner_backticks():
+    inner = "\n".join(
+        "```" if i % 7 == 0 else f"line {i} " + "z" * 40 for i in range(300)
+    )
+    t = format_permission("Bash", {"command": inner})
+    assert len(t) > 4000
+    parts = split_message(t)
+    assert len(parts) > 1
+    for i, p in enumerate(parts):
+        assert len(p) <= 4000
+        lines = p.split("\n")
+        if i > 0:
+            assert lines[0] == "````", lines[0]
+        if i < len(parts) - 1:
+            assert lines[-1] == "````", lines[-1]
+        # 每段里 ```` 围栏成对
+        assert lines.count("````") % 2 == 0
+    joined = "\n".join(parts)
+    assert joined.count("z" * 40) == inner.count("z" * 40)
+    assert parts[-1].endswith("回复「同意」或「拒绝」（1 / 2）")
