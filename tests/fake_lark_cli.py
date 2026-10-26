@@ -7,6 +7,8 @@
 - im +chat-create → {"data":{"chat_id":"oc_test_chat"}}
 - im +chat-members-list → {"data":{"bots":[],"users":[]}}；$FAKE_LARK_NOT_IN_CHAT=1 时报错退出 1
 - auth status → owner ou_test_owner
+- --version → lark-cli version 1.0.92（$FAKE_LARK_PRECOND 可改 dry-run 里一项的 status）
+- event consume --dry-run → preconditions 全 ok
 - event consume → 逐行输出 $FAKE_LARK_EVENTS 的内容，然后阻塞；
   $FAKE_LARK_IGNORE_TERM=1 时忽略 SIGTERM。
 """
@@ -28,7 +30,28 @@ def main(argv):
     if os.environ.get("FAKE_LARK_FAIL") == "1":
         print("fake lark-cli: forced failure", file=sys.stderr)
         return 1
-    if argv[:2] == ["im", "+chat-create"]:
+    if argv == ["--version"]:
+        print("lark-cli version 1.0.92")
+    elif argv[:2] == ["event", "consume"] and "--dry-run" in argv:
+        status = os.environ.get("FAKE_LARK_PRECOND", "ok")
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "dry_run": True,
+                    "data": {
+                        "decision": {
+                            "preconditions": [
+                                {"name": "credentials_available", "status": "ok"},
+                                {"name": "console_event_published", "status": status},
+                                {"name": "scopes_granted", "status": "ok"},
+                            ]
+                        }
+                    },
+                }
+            )
+        )
+    elif argv[:2] == ["im", "+chat-create"]:
         print(json.dumps({"ok": True, "data": {"chat_id": "oc_test_chat"}}))
     elif argv[:2] == ["im", "+messages-send"]:
         print(json.dumps({"ok": True, "data": {"message_id": "om_test_sent"}}))

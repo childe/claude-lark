@@ -11,6 +11,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
     if len(argv) == 2 and argv[0] == "hook":
         return _hook(argv[1])
+    if argv == ["doctor"]:
+        from . import doctor
+
+        return doctor.run()
     if argv == ["listen"]:
         from . import listener
 
@@ -18,7 +22,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if argv and argv[0] in ("slash", "on"):
         return _command(argv)
     print(
-        "用法: claude-lark --version | hook <event> | listen"
+        "用法: claude-lark --version | hook <event> | listen | doctor"
         " | slash --session <sid> --args <str> | on --session <sid> --name <str>",
         file=sys.stderr,
     )
