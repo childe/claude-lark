@@ -119,11 +119,14 @@ def test_format_questions():
 
 
 def test_strip_mentions():
-    assert strip_mentions("@_user_1 hello") == "hello"
+    assert strip_mentions("@_user_1 你好") == "你好"
+    assert strip_mentions("@_all 大家") == "大家"
     assert strip_mentions("hi @_all there") == "hi there"
     assert strip_mentions("@_user_1 @_user_22  go on ") == "go on"
-    assert strip_mentions("@claude-bot 你好") == "你好"
-    assert strip_mentions("@Bot @Other 你好 @后面的不动") == "你好 @后面的不动"
+    assert strip_mentions("@src/main.py 看下") == "@src/main.py 看下"
+    assert strip_mentions("@claude-bot 你好") == "@claude-bot 你好"
+    assert strip_mentions("@_allowed") == "@_allowed"
+    assert strip_mentions("a@_user_1b") == "a@_user_1b"
     assert strip_mentions("plain") == "plain"
 
 

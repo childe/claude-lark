@@ -123,16 +123,9 @@ def split_message(text: str, limit: int = 4000) -> list[str]:
     return parts
 
 
-_PLACEHOLDER = re.compile(r"@_user_\d+\s*|@_all\s*")
-_LEADING = re.compile(r"^\s*@\S+\s*")
+_PLACEHOLDER = re.compile(r"(?:@_user_\d+|@_all)(?!\w)[ \t]*")
 
 
 def strip_mentions(text: str) -> str:
-    """Remove @_user_N / @_all placeholders and leading @name mentions."""
-    text = _PLACEHOLDER.sub("", text)
-    while True:
-        new = _LEADING.sub("", text, count=1)
-        if new == text:
-            break
-        text = new
-    return text.strip()
+    """Remove @_user_N / @_all placeholders only; user-written @path is kept."""
+    return _PLACEHOLDER.sub("", text).strip()
