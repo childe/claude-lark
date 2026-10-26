@@ -15,7 +15,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         from . import listener
 
         return listener.main()
-    print("用法: claude-lark --version | hook <event> | listen", file=sys.stderr)
+    if argv and argv[0] in ("slash", "on"):
+        return _command(argv)
+    print(
+        "用法: claude-lark --version | hook <event> | listen"
+        " | slash --session <sid> --args <str> | on --session <sid> --name <str>",
+        file=sys.stderr,
+    )
     return 2
 
 
@@ -54,4 +60,31 @@ def _hook(event: str) -> int:
             hooks._term["defer"] = False
         except BaseException:
             pass
+    return 0
+
+
+def _command(argv: List[str]) -> int:
+    """slash / on 入口：把 RESULT 文本打到 stdout，永远 exit 0。"""
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="claude-lark " + argv[0], add_help=False)
+    ap.add_argument("--session", default="")
+    ap.add_argument(
+        "--args" if argv[0] == "slash" else "--name", dest="text", default=""
+    )
+    try:
+        ns, _ = ap.parse_known_args(argv[1:])
+        from . import commands
+
+        fn = commands.slash if argv[0] == "slash" else commands.on
+        out = fn(ns.session, ns.text)
+    except BaseException as e:  # noqa: B036
+        out = f"RESULT: 出错了：{type(e).__name__}"
+        try:
+            from . import feishu
+
+            feishu.log_exception(f"{argv[0]} (cli)")
+        except BaseException:
+            pass
+    print(out)
     return 0

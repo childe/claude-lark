@@ -5,6 +5,7 @@
 - $FAKE_LARK_SLEEP=N 时先睡 N 秒（测超时用）。
 - $FAKE_LARK_FAIL=1 时打印错误并以 1 退出。
 - im +chat-create → {"data":{"chat_id":"oc_test_chat"}}
+- im +chat-members-list → {"data":{"bots":[],"users":[]}}；$FAKE_LARK_NOT_IN_CHAT=1 时报错退出 1
 - auth status → owner ou_test_owner
 - event consume → 逐行输出 $FAKE_LARK_EVENTS 的内容，然后阻塞；
   $FAKE_LARK_IGNORE_TERM=1 时忽略 SIGTERM。
@@ -31,6 +32,11 @@ def main(argv):
         print(json.dumps({"ok": True, "data": {"chat_id": "oc_test_chat"}}))
     elif argv[:2] == ["im", "+messages-send"]:
         print(json.dumps({"ok": True, "data": {"message_id": "om_test_sent"}}))
+    elif argv[:2] == ["im", "+chat-members-list"]:
+        if os.environ.get("FAKE_LARK_NOT_IN_CHAT") == "1":
+            print("fake lark-cli: bot not in chat", file=sys.stderr)
+            return 1
+        print(json.dumps({"ok": True, "data": {"bots": [], "users": []}}))
     elif argv[:2] == ["auth", "status"]:
         print(
             json.dumps(

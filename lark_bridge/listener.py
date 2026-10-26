@@ -359,6 +359,12 @@ def main(check_interval: float = 30, restart_delay: float = 5) -> int:
                 pass
 
 
+def is_running() -> bool:
+    """监听进程是否存活（按 pid 文件判断）。"""
+    pid = _read_pid()
+    return pid is not None and procs.pid_alive(pid)
+
+
 def ensure_running() -> None:
     """监听进程没在跑就在后台拉起一个。自身不抛出。"""
     try:

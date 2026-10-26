@@ -116,3 +116,13 @@ def owner_open_id() -> str:
     if not isinstance(oid, str) or not oid:
         raise FeishuError("auth status has no identities.user.openId")
     return oid
+
+
+def bot_in_chat(chat_id: str) -> bool:
+    """机器人能否读到该群的成员列表（不在群里时 lark-cli 会报错）。"""
+    try:
+        _run(["im", "+chat-members-list", "--as", "bot", "--chat-id", chat_id])
+    except FeishuError as e:
+        log_error(f"bot_in_chat {chat_id}: {e}")
+        return False
+    return True
