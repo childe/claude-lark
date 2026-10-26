@@ -264,6 +264,10 @@ def _process_line(line: str) -> None:
         return
     if not isinstance(ev, dict):
         return
+    _log(
+        f"event {ev.get('message_id')} type={ev.get('message_type')}"
+        f" chat={ev.get('chat_id')} sender_type={ev.get('sender_type')}"
+    )
     try:
         handle_event(ev, _load_owner())
     except Exception:
