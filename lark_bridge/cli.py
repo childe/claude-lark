@@ -11,7 +11,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
     if len(argv) == 2 and argv[0] == "hook":
         return _hook(argv[1])
-    print("用法: claude-lark --version | hook <event>", file=sys.stderr)
+    if argv == ["listen"]:
+        from . import listener
+
+        return listener.main()
+    print("用法: claude-lark --version | hook <event> | listen", file=sys.stderr)
     return 2
 
 
