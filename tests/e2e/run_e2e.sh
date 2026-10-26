@@ -525,15 +525,18 @@ bridged_at_terminal() {
             echo "群里没有收到 已连接"
             return 1
         fi
+        if ! wait_idle_bridged; then
+            echo "Stop hook 没有进入等待"
+            return 1
+        fi
     fi
-    if ! wait_idle_bridged; then
-        echo "Stop hook 没有进入等待"
-        return 1
-    fi
-    tmux send-keys -t "$TMUX_S" Escape
-    if ! wait_for 15 no_stop_hook; then
-        echo "Esc 后 Stop hook 仍在运行"
-        return 1
+    # 已经在终端（比如刚 /compact 过）就没有 Stop hook 在等，不用按 Esc
+    if wait_for 5 stop_hook_waiting; then
+        tmux send-keys -t "$TMUX_S" Escape
+        if ! wait_for 15 no_stop_hook; then
+            echo "Esc 后 Stop hook 仍在运行"
+            return 1
+        fi
     fi
     sleep 1
     [ -e "$sd/enabled" ] || { echo "enabled 不存在"; return 1; }
