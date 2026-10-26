@@ -9,7 +9,8 @@
 - auth status → owner ou_test_owner
 - --version → lark-cli version 1.0.92（$FAKE_LARK_PRECOND 可改 dry-run 里一项的 status）
 - event consume --dry-run → preconditions 全 ok
-- event consume → 逐行输出 $FAKE_LARK_EVENTS 的内容，然后阻塞；
+- event consume → 逐行输出 $FAKE_LARK_EVENTS 的内容，然后像 tail -f 一样继续跟随
+  文件增长（文件一开始不存在也会等它出现），只输出完整的行；
   $FAKE_LARK_IGNORE_TERM=1 时忽略 SIGTERM。
 """
 
@@ -18,6 +19,28 @@ import os
 import signal
 import sys
 import time
+
+
+def _follow(path):
+    """tail -f：输出已有的完整行，再每 0.2 秒检查一次新追加的行。永不返回。"""
+    pos = 0
+    buf = b""
+    while True:
+        if path:
+            try:
+                with open(path, "rb") as f:
+                    f.seek(pos)
+                    chunk = f.read()
+            except OSError:
+                chunk = b""
+            if chunk:
+                pos += len(chunk)
+                buf += chunk
+                *lines, buf = buf.split(b"\n")
+                for line in lines:
+                    sys.stdout.write(line.decode("utf-8", "replace") + "\n")
+                sys.stdout.flush()
+        time.sleep(0.2)
 
 
 def main(argv):
@@ -74,14 +97,7 @@ def main(argv):
     elif argv[:2] == ["event", "consume"]:
         if os.environ.get("FAKE_LARK_IGNORE_TERM") == "1":
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        events = os.environ.get("FAKE_LARK_EVENTS")
-        if events and os.path.exists(events):
-            with open(events) as f:
-                for line in f:
-                    sys.stdout.write(line if line.endswith("\n") else line + "\n")
-                    sys.stdout.flush()
-        while True:
-            time.sleep(3600)
+        _follow(os.environ.get("FAKE_LARK_EVENTS"))
     return 0
 
 
