@@ -28,6 +28,10 @@ def listener_pid_file() -> Path:
     return home() / "listener.pid"
 
 
+def listener_lock_file() -> Path:
+    return home() / "listener.lock"
+
+
 def listener_log() -> Path:
     return home() / "listener.log"
 

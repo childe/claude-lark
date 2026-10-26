@@ -286,10 +286,24 @@ def test_listener_main_exits_immediately_without_enabled_sessions(fake):
     assert fake() == []
 
 
+def _hold_listener_lock():
+    """模拟另一个正在运行的监听进程：拿住 listener.lock。close() 即释放。"""
+    import fcntl
+
+    f = open(paths.home() / "listener.lock", "a+")
+    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return f
+
+
 def test_listener_single_instance(fake):
     bind()
     paths.listener_pid_file().write_text(str(os.getppid()))
-    assert listener.main(check_interval=0.1, restart_delay=0.1) == 0
+    other = _hold_listener_lock()
+    try:
+        assert listener.is_running()
+        assert listener.main(check_interval=0.1, restart_delay=0.1) == 0
+    finally:
+        other.close()
     assert fake() == []
     # 别人的 pid 文件不能被删
     assert paths.listener_pid_file().read_text() == str(os.getppid())
@@ -441,13 +455,15 @@ def test_ensure_running_waits_for_pid_lock(fake, monkeypatch):
         listener.subprocess, "Popen", lambda *a, **k: spawned.append(a[0])
     )
     paths.listener_pid_file().write_text(str(os.getppid()))
+    other = _hold_listener_lock()
     with listener._pid_lock():
         th = threading.Thread(target=listener.ensure_running)
         th.start()
         time.sleep(0.3)
         assert th.is_alive() and spawned == []
-        # 模拟退出中的监听进程在锁内删掉 pid 文件
+        # 模拟退出中的监听进程在锁内删掉 pid 文件、放掉存活锁
         paths.listener_pid_file().unlink()
+        other.close()
     th.join(5)
     assert len(spawned) == 1 and spawned[0][-1] == "listen"
 
@@ -486,3 +502,64 @@ def test_listener_kills_child_ignoring_sigterm(fake, monkeypatch):
     assert not alive, "read loop stayed blocked on a child ignoring SIGTERM"
     assert out["rc"] == 0
     assert "ignored SIGTERM" in paths.listener_log().read_text()
+
+
+# ---------- final review: pid reuse ----------
+
+
+def test_stale_pid_file_with_reused_live_pid_does_not_block_listener(fake):
+    """pid 文件里的数字现在属于别的活进程（pid 复用）：不能当成监听进程在跑。"""
+    claude = subprocess.Popen(["sleep", "60"])
+    bind(claude_pid=claude.pid)
+    paths.listener_pid_file().write_text(str(os.getppid()))
+    assert not listener.is_running()
+
+    def killer():
+        _wait(lambda: _child_pids())
+        claude.kill()
+        claude.wait()
+
+    th = threading.Thread(target=killer)
+    th.start()
+    rc = listener.main(check_interval=0.1, restart_delay=0.1)
+    th.join()
+    claude.kill()
+    claude.wait()
+    assert rc == 0
+    assert _child_pids(), "listener never started lark-cli"
+    assert not listener.is_running()
+
+
+def test_listener_holds_lock_while_running(fake):
+    claude = subprocess.Popen(["sleep", "60"])
+    bind(claude_pid=claude.pid)
+    seen = []
+
+    def watcher():
+        _wait(lambda: _child_pids())
+        seen.append(listener.is_running())
+        claude.kill()
+        claude.wait()
+
+    th = threading.Thread(target=watcher)
+    th.start()
+    listener.main(check_interval=0.1, restart_delay=0.1)
+    th.join()
+    assert seen == [True]
+    assert not listener.is_running()
+
+
+def test_ensure_running_skips_spawn_while_lock_held(fake, monkeypatch):
+    spawned = []
+    monkeypatch.setattr(
+        listener.subprocess, "Popen", lambda *a, **k: spawned.append(a[0])
+    )
+    other = _hold_listener_lock()
+    try:
+        listener.ensure_running()  # 没有 pid 文件，但锁被占着
+        assert spawned == []
+    finally:
+        other.close()
+    paths.listener_pid_file().write_text(str(os.getppid()))  # 活着但不是监听进程
+    listener.ensure_running()
+    assert len(spawned) == 1

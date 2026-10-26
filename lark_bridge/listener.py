@@ -142,7 +142,8 @@ def _read_pid():
 
 @contextlib.contextmanager
 def _pid_lock():
-    """ "判断旧 pid 已死 → 删除 → 新建"三步要原子，否则两个进程可能都拿到。"""
+    """短锁：监听进程的"拿存活锁 / 决定退出并放锁"与 ensure_running 的
+    "看有没有监听进程 → 拉起"互斥，否则开启中的会话可能没人监听。"""
     p = paths.home() / "listener.pid.lock"
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "a+") as f:
@@ -153,32 +154,65 @@ def _pid_lock():
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
-def _acquire_pid_file() -> bool:
-    pidf = paths.listener_pid_file()
-    with _pid_lock():
-        for _ in range(2):
-            try:
-                fd = os.open(pidf, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-            except FileExistsError:
-                old = _read_pid()
-                if old is not None and old != os.getpid() and procs.pid_alive(old):
-                    return False
-                try:
-                    pidf.unlink()
-                except FileNotFoundError:
-                    pass
-                continue
-            with os.fdopen(fd, "w") as f:
-                f.write(str(os.getpid()))
-            return True
+# 监听进程整个生命周期持有 listener.lock 的排他 flock。"有没有监听进程在跑"
+# 只看这把锁：进程死了锁自动释放，不受 pid 复用影响。pid 文件只用于展示和 kill。
+_life = {"f": None}
+
+
+def _lock_held_by_other() -> bool:
+    p = paths.listener_lock_file()
+    if not p.exists():
+        return False
+    try:
+        f = open(p, "a+")
+    except OSError:
+        return False
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    finally:
+        f.close()  # 拿到了也立刻放掉
     return False
+
+
+def _acquire_pid_file() -> bool:
+    """拿存活锁并写 pid 文件；锁被别人持有（已有监听进程）返回 False。"""
+    with _pid_lock():
+        p = paths.listener_lock_file()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        f = open(p, "a+")  # Python 打开的 fd 不会被子进程继承
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            f.close()
+            return False
+        except BaseException:
+            f.close()
+            raise
+        _life["f"] = f
+        state._atomic_write(paths.listener_pid_file(), str(os.getpid()))
+        return True
+
+
+def _drop_life_lock_locked() -> None:
+    """调用方持有 _pid_lock：删掉自己的 pid 文件，放掉存活锁。"""
+    try:
+        if _read_pid() == os.getpid():
+            paths.listener_pid_file().unlink()
+    except OSError:
+        pass
+    f, _life["f"] = _life["f"], None
+    if f is not None:
+        f.close()
 
 
 def _release_pid_file() -> None:
     try:
         with _pid_lock():
-            if _read_pid() == os.getpid():
-                paths.listener_pid_file().unlink()
+            _drop_life_lock_locked()
     except OSError:
         pass
 
@@ -186,20 +220,14 @@ def _release_pid_file() -> None:
 def _try_exit() -> bool:
     """在 pid 锁里做退出决定，与 ensure_running 互斥。
 
-    先删 pid 文件再复查：若期间有会话开启（它的 ensure_running 看到了我们的 pid
-    而没拉起新进程），就写回 pid 文件继续跑，返回 False；否则返回 True，调用方退出。"""
+    复查一遍：若期间有会话开启（它的 ensure_running 看到锁被我们持有而没拉起
+    新进程），就继续跑，返回 False；否则删 pid 文件、放掉存活锁，返回 True，
+    调用方退出。放锁之后 ensure_running 就会拉起新的监听进程。"""
     with _pid_lock():
-        if _read_pid() != os.getpid():
-            return True  # pid 文件不归我们（被别人接管），直接退出
-        pidf = paths.listener_pid_file()
-        try:
-            pidf.unlink()
-        except FileNotFoundError:
-            pass
         if _any_enabled():
-            pidf.write_text(str(os.getpid()))
             _log("session enabled during shutdown, keep running")
             return False
+        _drop_life_lock_locked()
         return True
 
 
@@ -360,19 +388,17 @@ def main(check_interval: float = 30, restart_delay: float = 5) -> int:
 
 
 def is_running() -> bool:
-    """监听进程是否存活（按 pid 文件判断）。"""
-    pid = _read_pid()
-    return pid is not None and procs.pid_alive(pid)
+    """监听进程是否存活：listener.lock 被别人持有即存活（与 pid 文件无关）。"""
+    return _lock_held_by_other()
 
 
 def ensure_running() -> None:
     """监听进程没在跑就在后台拉起一个。自身不抛出。"""
     try:
         # 与监听进程的退出决定（_try_exit）互斥：要么它看到我们刚开启的会话而留下，
-        # 要么我们看到 pid 文件已删而拉起新进程
+        # 要么我们看到存活锁已放掉而拉起新进程
         with _pid_lock():
-            pid = _read_pid()
-            if pid is not None and procs.pid_alive(pid):
+            if _lock_held_by_other():
                 return
             log = paths.listener_log()
             log.parent.mkdir(parents=True, exist_ok=True)
