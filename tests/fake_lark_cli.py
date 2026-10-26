@@ -14,12 +14,14 @@
 - event consume → 逐行输出 $FAKE_LARK_EVENTS 的内容，然后像 tail -f 一样继续跟随
   文件增长（文件一开始不存在也会等它出现），只输出完整的行；
   $FAKE_LARK_IGNORE_TERM=1 时忽略 SIGTERM。
+  和真实 lark-cli 一样，stdin 读到 EOF 就退出（rc=0）。
 """
 
 import json
 import os
 import signal
 import sys
+import threading
 import time
 
 
@@ -43,6 +45,13 @@ def _follow(path):
                     sys.stdout.write(line.decode("utf-8", "replace") + "\n")
                 sys.stdout.flush()
         time.sleep(0.2)
+
+
+def _exit_on_stdin_eof():
+    """真实 lark-cli 的 event consume 把 stdin EOF 当作退出信号。"""
+    while sys.stdin.buffer.read(4096):
+        pass
+    os._exit(0)
 
 
 def main(argv):
@@ -103,6 +112,7 @@ def main(argv):
     elif argv[:2] == ["event", "consume"]:
         if os.environ.get("FAKE_LARK_IGNORE_TERM") == "1":
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        threading.Thread(target=_exit_on_stdin_eof, daemon=True).start()
         _follow(os.environ.get("FAKE_LARK_EVENTS"))
     return 0
 

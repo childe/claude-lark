@@ -339,7 +339,8 @@ def main(check_interval: float = 30, restart_delay: float = 5) -> int:
                                 "--as",
                                 "bot",
                             ],
-                            stdin=subprocess.DEVNULL,
+                            # lark-cli 把 stdin EOF 当作退出信号：给一根不写也不关的管道
+                            stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE,
                             stderr=errlog,
                             text=True,
@@ -366,6 +367,8 @@ def main(check_interval: float = 30, restart_delay: float = 5) -> int:
                         proc.wait()
                     if proc.stdout:
                         proc.stdout.close()
+                    if proc.stdin:
+                        proc.stdin.close()
             if stop.is_set():
                 break
             _log(f"lark-cli exited rc={rc}, restarting in {restart_delay}s")
