@@ -229,9 +229,27 @@ def test_cli_slash_and_on(fake, lark_home):
         assert r.returncode == 0
         assert r.stdout.startswith(("RESULT: 已开启桥接", "RESULT: 未能识别 claude"))
     finally:
+        # 在 claude 里跑测试时（真实进程树里有 claude）桥接会真的开启，
+        # ensure_running 在后台拉起的监听进程要等它写出 pid 文件再杀，否则会泄漏
+        if r.stdout.startswith("RESULT: 已开启桥接"):
+            _kill_listener()
+
+
+def _kill_listener(timeout=10):
+    import time
+
+    from lark_bridge import procs
+
+    end = time.time() + timeout
+    pid = None
+    while time.time() < end and not pid:
         pid = listener._read_pid()
-        if pid:
-            os.kill(pid, 15)
+        time.sleep(0.05)
+    assert pid, "listener never wrote its pid file"
+    os.kill(pid, 15)
+    while time.time() < end and procs.pid_alive(pid):
+        time.sleep(0.05)
+    assert not procs.pid_alive(pid)
 
 
 def test_cli_bad_session_never_raises(lark_home):

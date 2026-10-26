@@ -37,31 +37,64 @@ MSG_SEQ=0
 
 # ---------- 清理 ----------
 
-cleanup() {
-    tmux kill-session -t "$TMUX_S" 2>/dev/null
-    local pidf="$CLAUDE_LARK_HOME/listener.pid" lpid kids
-    if [ -f "$pidf" ]; then
-        lpid="$(cat "$pidf" 2>/dev/null)"
-        if [ -n "$lpid" ]; then
-            kids="$(pgrep -P "$lpid" 2>/dev/null)"
-            kill "$lpid" 2>/dev/null
-            for _ in 1 2 3 4 5 6 7 8 9 10; do
-                kill -0 "$lpid" 2>/dev/null || break
-                sleep 0.5
-            done
-            kill -9 "$lpid" $kids 2>/dev/null
-        fi
+# 本次运行拥有的进程：tmux pane 的全部后代（claude、hook、/lark 命令）
+# 加上 pid 文件里的监听进程及其后代（监听进程用 start_new_session 脱离了 pane）。
+# 只按 pid 关系认领，不按命令行模式匹配，免得误杀同一仓库里的其他进程。
+PANE_PID=""
+LISTENER_PID=""
+
+descendants() {
+    local p c
+    for p in "$@"; do
+        for c in $(pgrep -P "$p" 2>/dev/null); do
+            echo "$c"
+            descendants "$c"
+        done
+    done
+}
+
+listener_pid() {
+    local pidf="$CLAUDE_LARK_HOME/listener.pid" p
+    p="$(cat "$pidf" 2>/dev/null)"
+    [ -n "$p" ] && LISTENER_PID="$p"
+    echo "$LISTENER_PID"
+}
+
+run_pids() {
+    local l
+    l="$(listener_pid)"
+    [ -n "$PANE_PID" ] && descendants "$PANE_PID"
+    if [ -n "$l" ] && kill -0 "$l" 2>/dev/null; then
+        echo "$l"
+        descendants "$l"
     fi
-    # 被 tmux 杀掉的 claude 留下的 hook 进程（命令行里带本仓库的 bin 路径）
-    pkill -f "$BIN hook" 2>/dev/null
-    pkill -f "$BIN listen" 2>/dev/null
-    pkill -f "$FAKE event consume" 2>/dev/null
-    sleep 0.5
-    local left
-    left="$(pgrep -fl "$REPO/(bin/claude-lark|tests/fake_lark_cli)" 2>/dev/null)"
+}
+
+alive() {
+    local p
+    for p in "$@"; do
+        kill -0 "$p" 2>/dev/null && echo "$p"
+    done
+}
+
+cleanup() {
+    local pids lpid left
+    # 先收集 pid 再关 tmux：claude 一死，hook 进程就被 init 收养，查不到父子关系了
+    pids="$(run_pids | sort -u)"
+    lpid="$(listener_pid)"
+    tmux kill-session -t "$TMUX_S" 2>/dev/null
+    [ -n "$lpid" ] && kill "$lpid" 2>/dev/null
+    [ -n "$pids" ] && kill $pids 2>/dev/null
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        [ -z "$(alive $pids $lpid)" ] && break
+        sleep 0.5
+    done
+    left="$(alive $pids $lpid)"
+    [ -n "$left" ] && kill -9 $left 2>/dev/null && sleep 0.5
+    left="$(alive $pids $lpid)"
     if [ -n "$left" ]; then
-        echo "WARN: 清理后仍有进程：" >&2
-        echo "$left" >&2
+        echo "WARN: 清理后本次运行的进程仍在：" >&2
+        ps -o pid=,args= -p "$(echo $left | tr ' ' ',')" >&2
     fi
     echo "临时目录：$RUN"
 }
@@ -78,11 +111,11 @@ send_text() {
 }
 log_lines() { [ -f "$FAKE_LARK_LOG" ] && wc -l <"$FAKE_LARK_LOG" | tr -d ' ' || echo 0; }
 
-# sent_since <起始行号> <子串>：起始行之后有内容含该子串的 +messages-send
+# sent_since <起始行号> <子串>...：起始行之后有一条 +messages-send 同时含全部子串
 sent_since() {
-    python3 - "$FAKE_LARK_LOG" "$1" "$2" <<'PY'
+    python3 - "$FAKE_LARK_LOG" "$@" <<'PY'
 import json, sys
-path, start, needle = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+path, start, needles = sys.argv[1], int(sys.argv[2]), sys.argv[3:]
 try:
     lines = open(path, encoding="utf-8").read().splitlines()[start:]
 except OSError:
@@ -90,8 +123,30 @@ except OSError:
 for line in lines:
     argv = json.loads(line)
     if argv[:2] == ["im", "+messages-send"] and "--markdown" in argv:
-        if needle in argv[argv.index("--markdown") + 1]:
+        body = argv[argv.index("--markdown") + 1]
+        if all(n in body for n in needles):
             sys.exit(0)
+sys.exit(1)
+PY
+}
+
+# send_count_since <起始行号>：起始行之后 +messages-send 的条数
+send_count_since() { sends_since "$1" | wc -l | tr -d ' '; }
+
+# reply_after <起始行号> <正文>：起始行之后、正文为 <正文> 的那条之后还有别的 +messages-send
+reply_after() {
+    python3 - "$FAKE_LARK_LOG" "$1" "$2" <<'PY'
+import json, sys
+path, start, marker = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+seen = False
+for line in open(path, encoding="utf-8").read().splitlines()[start:]:
+    argv = json.loads(line)
+    if argv[:2] != ["im", "+messages-send"] or "--markdown" not in argv:
+        continue
+    body = argv[argv.index("--markdown") + 1]
+    if seen and body != marker:
+        sys.exit(0)
+    seen = seen or body == marker
 sys.exit(1)
 PY
 }
@@ -142,7 +197,17 @@ wait_for() {
 }
 
 pane_has() { pane | grep -qF -- "$1"; }
-stop_hook_waiting() { pgrep -f "$BIN hook stop" >/dev/null; }
+# 本次 pane 的后代里有没有 Stop hook 进程（hook 由 claude 经 sh -c 启动）
+stop_hook_waiting() {
+    local p
+    for p in $(descendants "$PANE_PID"); do
+        case "$(ps -o args= -p "$p" 2>/dev/null)" in
+        *"$BIN hook stop"*) return 0 ;;
+        esac
+    done
+    return 1
+}
+no_stop_hook() { ! stop_hook_waiting; }
 session_id() { ls "$CLAUDE_LARK_HOME/sessions" 2>/dev/null | head -1; }
 sdir() { echo "$CLAUDE_LARK_HOME/sessions/$(session_id)"; }
 
@@ -193,6 +258,8 @@ tmux new-session -d -s "$TMUX_S" -x 160 -y 50 -c "$PROJ" \
     "CLAUDE_LARK_HOME='$CLAUDE_LARK_HOME' CLAUDE_LARK_CLI='$FAKE' FAKE_LARK_LOG='$FAKE_LARK_LOG' \
 FAKE_LARK_EVENTS='$FAKE_LARK_EVENTS' CLAUDE_LARK_WAIT_SECONDS=${WAIT_SECONDS} \
 CLAUDE_CODE_STOP_HOOK_BLOCK_CAP=1000 claude --model $MODEL --permission-mode default"
+
+PANE_PID="$(tmux list-panes -t "$TMUX_S" -F '#{pane_pid}' | head -1)"
 
 # 新目录首次启动有信任对话框
 if wait_for 30 pane_has "trust"; then
@@ -317,7 +384,10 @@ perm_case() {
         return
     fi
     # 等这一轮结束（Stop hook 发出回复并重新进入等待）
-    wait_for $TIMEOUT sent_since "$((n1 + 1))" ""
+    if ! wait_for $TIMEOUT reply_after "$n1" "${ack}"; then
+        fail "${name}" "${ack} 之后 Claude 的回复没有发到群里"
+        return
+    fi
     wait_idle_bridged
     if [ "$expect" = 1 ]; then
         if wait_for 10 test -e "$PROJ/${file}"; then
@@ -349,7 +419,8 @@ s5() {
     fi
     n1=$(log_lines)
     inject "2"
-    if wait_for $TIMEOUT sent_since "$n1" "绿"; then
+    # "答案是" 只会出现在 Claude 按要求写的最终回复里，提问消息和 hook 都不会发它
+    if wait_for $TIMEOUT sent_since "$n1" "答案是" "绿色"; then
         pass "5 提问转发（回复 2 → 最终回复含 绿色）"
     else
         fail "5 提问转发" "最终回复里没有第二个选项 绿色：$(sends_since "$n1" | tr '\n' ' ')"
@@ -384,7 +455,7 @@ s6() {
     fi
     n0=$(log_lines)
     tmux send-keys -t "$TMUX_S" Escape
-    if ! wait_for 15 bash -c "! pgrep -f '$BIN hook stop'"; then
+    if ! wait_for 15 no_stop_hook; then
         fail "6 Esc 拿回终端" "Esc 后 Stop hook 仍在运行"
         return
     fi
@@ -394,8 +465,9 @@ s6() {
         fail "6 Esc 拿回终端" "群里没有收到 💻 终端：只回复 LOCAL"
         return
     fi
-    if ! wait_for $TIMEOUT sent_since "$((n0 + 1))" "LOCAL"; then
-        fail "6 Esc 拿回终端" "LOCAL 的回复没有发到群里"
+    # 回复内容由模型决定（haiku 偶尔不照抄 LOCAL），这里只要求这一轮的回复发到了群里
+    if ! wait_for $TIMEOUT reply_after "$n0" "💻 终端：只回复 LOCAL"; then
+        fail "6 Esc 拿回终端" "终端这一轮的回复没有发到群里"
         return
     fi
     wait_idle_bridged
@@ -420,7 +492,7 @@ s8() {
         fail "8 群里 /off" "群里没有收到 已断开"
         return
     fi
-    if ! wait_for 15 bash -c "! pgrep -f '$BIN hook stop'"; then
+    if ! wait_for 15 no_stop_hook; then
         fail "8 群里 /off" "/off 后 Stop hook 仍在等待"
         return
     fi
@@ -435,7 +507,7 @@ s8() {
     sleep 5
     if stop_hook_waiting; then
         fail "8 群里 /off" "下一轮 Stop hook 仍在阻塞"
-    elif [ "$(log_lines)" != "$n1" ]; then
+    elif [ "$(send_count_since "$n1")" != 0 ]; then
         fail "8 群里 /off" "关闭后仍往群里发消息：$(sends_since "$n1" | tr '\n' ' ')"
     else
         pass "8 群里 /off（绑定保留，enabled 消失，下一轮不阻塞也不发消息）"
