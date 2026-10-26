@@ -279,7 +279,7 @@ def test_prompt_mirrors_terminal_input_and_resets_blocks(bridged):
     state.set_counter(SID, "keepalive_pending", 1)
     clock = Clock()
     assert hooks.run("prompt", prompt_input("修一下 bug"), clock.now, clock.sleep) == ""
-    assert sent_texts(bridged()) == ["💻 终端：修一下 bug"]
+    assert _wait_until(lambda: sent_texts(bridged()) == ["💻 终端：修一下 bug"])
     assert state.get_counter(SID, "blocks") == 0
     assert state.get_counter(SID, "keepalive_pending") == 0
     assert clock.sleeps == 0
@@ -487,3 +487,45 @@ def test_bin_session_end_subprocess(bridged):
     assert r.returncode == 0 and r.stdout == "" and r.stderr == ""
     assert not state.is_enabled(SID)
     assert sent_texts(bridged()) == [hooks.MSG_SESSION_ENDED]
+
+
+# ---------------- final review: terminal mirror must not block
+
+
+def _wait_until(cond, timeout=15):
+    import time
+
+    end = time.time() + timeout
+    while time.time() < end:
+        if cond():
+            return True
+        time.sleep(0.05)
+    return cond()
+
+
+def test_prompt_mirror_does_not_block_terminal(bridged, monkeypatch):
+    import time
+
+    monkeypatch.setenv("FAKE_LARK_SLEEP", "3")
+    clock = Clock()
+    t0 = time.monotonic()
+    out = hooks.run("prompt", prompt_input("修一下 bug"), clock.now, clock.sleep)
+    elapsed = time.monotonic() - t0
+    assert out == ""
+    assert elapsed < 1.5, f"prompt hook blocked {elapsed:.1f}s on the send"
+    # 后台进程稍后把它发出去，临时文件随后删掉
+    assert _wait_until(lambda: sent_texts(bridged()) == ["💻 终端：修一下 bug"])
+    sdir = state.paths.session_dir(SID)
+    assert _wait_until(lambda: not list(sdir.glob("mirror-*")))
+
+
+def test_mirror_refuses_file_outside_session_dir(bridged, tmp_path):
+    evil = tmp_path / "mirror-1.txt"
+    evil.write_text("secret")
+    hooks.mirror(SID, str(evil))
+    assert evil.exists() and bridged() == []
+    inside = state.paths.session_dir(SID) / "mirror-2.txt"
+    inside.write_text("多行\n文本")
+    hooks.mirror(SID, str(inside))
+    assert not inside.exists()
+    assert sent_texts(bridged()) == ["💻 终端：多行\n文本"]

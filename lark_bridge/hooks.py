@@ -3,8 +3,11 @@
 import json
 import os
 import signal
+import subprocess
+import sys
 import threading
 import time
+from pathlib import Path
 
 from . import feishu, paths, state
 from .text import (
@@ -176,10 +179,60 @@ def _prompt(sid, data, binding, start, now, sleep) -> str:
     prompt = data.get("prompt")
     if isinstance(prompt, str) and prompt.strip():
         if not prompt.lstrip().startswith("/lark"):
-            feishu.send(
-                binding.chat_id, TERMINAL_PREFIX + prompt, timeout=SHORT_SEND_TIMEOUT
-            )
+            _spawn_mirror(sid, prompt)
     return ""
+
+
+_MIRROR_PREFIX = "mirror-"
+
+
+def _spawn_mirror(sid, text: str) -> None:
+    """把终端输入交给一个脱离的后台进程发到群里，立刻返回：UserPromptSubmit
+    会卡住终端，不能等飞书。文本经会话目录里的临时文件传过去。"""
+    d = paths.session_dir(sid)
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"{_MIRROR_PREFIX}{time.time_ns()}-{os.getpid()}.txt"
+    f.write_text(text, encoding="utf-8")
+    script = Path(__file__).resolve().parent.parent / "bin" / "claude-lark"
+    try:
+        subprocess.Popen(
+            [sys.executable, str(script), "mirror", "--session", sid, "--file", str(f)],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=dict(os.environ),
+        )
+    except Exception:
+        try:
+            f.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def mirror(sid, file_path: str) -> None:
+    """后台进程入口：读出临时文件、删掉它、发到绑定的群。自身不抛出。"""
+    try:
+        d = paths.session_dir(sid).resolve()
+        f = Path(file_path).resolve()
+        if f.parent != d or not f.name.startswith(_MIRROR_PREFIX):
+            feishu.log_error(f"mirror: refusing file outside session dir: {f}")
+            return
+        try:
+            text = f.read_text(encoding="utf-8")
+        finally:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        b = state.load_binding(sid)
+        if b is None:
+            feishu.log_error(f"mirror: session {sid} has no binding")
+            return
+        feishu.send(b.chat_id, TERMINAL_PREFIX + text)
+    except Exception:
+        feishu.log_exception("mirror")
 
 
 def _acquire_interactive(sid, deadline: float, now, sleep):

@@ -459,8 +459,8 @@ def test_stop_delivers_just_below_cap(bridged):
     assert state.get_counter(SID, "blocks") == 999
 
 
-def test_prompt_send_uses_short_timeout(bridged, monkeypatch):
-    # M3
+def test_prompt_hook_makes_no_inline_send(bridged, monkeypatch):
+    # M3 → final review: the mirror send happens in a detached process
     seen = []
     real = feishu._run
 
@@ -471,9 +471,9 @@ def test_prompt_send_uses_short_timeout(bridged, monkeypatch):
     monkeypatch.setattr(feishu, "_run", spy)
     clock = Clock()
     hooks.run("prompt", prompt_input("hello"), clock.now, clock.sleep)
-    assert seen == [5]
+    assert seen == []
     feishu.send("oc_test_chat", "x")
-    assert seen == [5, feishu.TIMEOUT]
+    assert seen == [feishu.TIMEOUT]
 
 
 def test_send_timeout_is_enforced(bridged, monkeypatch):

@@ -21,6 +21,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return listener.main()
     if argv and argv[0] in ("slash", "on"):
         return _command(argv)
+    if argv and argv[0] == "mirror":
+        return _mirror(argv)
     print(
         "用法: claude-lark --version | hook <event> | listen | doctor"
         " | slash --session <sid> --args <str> | on --session <sid> --name <str>",
@@ -91,4 +93,21 @@ def _command(argv: List[str]) -> int:
         except BaseException:
             pass
     print(out)
+    return 0
+
+
+def _mirror(argv: List[str]) -> int:
+    """UserPromptSubmit 拉起的后台进程：把终端输入发到群里。永远 exit 0。"""
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="claude-lark mirror", add_help=False)
+    ap.add_argument("--session", default="")
+    ap.add_argument("--file", default="")
+    try:
+        ns, _ = ap.parse_known_args(argv[1:])
+        from . import hooks
+
+        hooks.mirror(ns.session, ns.file)
+    except BaseException:  # noqa: B036
+        pass
     return 0
