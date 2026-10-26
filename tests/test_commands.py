@@ -345,3 +345,17 @@ def test_find_claude_ancestor_real_ps(tmp_path):
     ).stdout.split()
     assert out[0] == out[1]
     assert procs._ps("ppid,comm", os.getpid()).split()[0].isdigit()
+
+
+# ---------------- final review
+
+
+def test_enable_fails_loudly_when_claude_start_time_unreadable(fake, monkeypatch):
+    """记不下 claude 的启动时间，enabled 就不会生效：/lark 不能假装成功。"""
+    monkeypatch.setattr(state.procs, "start_time", lambda pid: "")
+    bind(SID, name="旧群")
+    out = commands.slash(SID, "")
+    assert out.startswith("RESULT: ") and "已开启桥接" not in out
+    assert "启动时间" in out
+    assert not state.is_enabled(SID)
+    assert fake.started == []

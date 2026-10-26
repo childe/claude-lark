@@ -43,29 +43,46 @@ def save_binding(b: Binding):
 
 
 def is_enabled(sid) -> bool:
+    """enabled 文件存在，且（记了 pid 时）那个 claude 进程还是当初那个。
+
+    文件内容是 "<pid>\\n<启动时间>"：pid 活着且启动时间一致才算开启，
+    pid 被别的进程复用（例如重启后）就不算。只有 pid 的旧格式也不算。
+    空文件（没有 pid）算开启。判定为失效时顺手删掉 enabled。"""
     f = paths.session_dir(sid) / "enabled"
     try:
         content = f.read_text().strip()
     except OSError:
         return False
-    if content:
+    if not content:
+        return True
+    pid_s, _, start = content.partition("\n")
+    start = " ".join(start.split())
+    try:
+        pid = int(pid_s.strip())
+    except ValueError:
+        pid = None
+    alive = pid is not None and bool(start) and procs.pid_alive(pid)
+    if alive:
+        now = procs.start_time(pid)
+        # ps 偶尔取不到（进程刚好退出等）时无法否定，按 pid 存活判断
+        alive = not now or now == start
+    if not alive:
         try:
-            pid = int(content)
-        except ValueError:
-            pid = None
-        if pid is not None and not procs.pid_alive(pid):
-            try:
-                f.unlink()
-            except OSError:
-                pass
-            return False
-    return True
+            f.unlink()
+        except OSError:
+            pass
+    return alive
 
 
 def set_enabled(sid, on: bool, claude_pid=None):
+    """claude_pid 不为 None 时连同它的启动时间一起记下（取不到启动时间则
+    is_enabled 会判定为未开启，调用方应检查）。"""
     f = paths.session_dir(sid) / "enabled"
     if on:
-        _atomic_write(f, "" if claude_pid is None else str(claude_pid))
+        if claude_pid is None:
+            _atomic_write(f, "")
+        else:
+            _atomic_write(f, f"{claude_pid}\n{procs.start_time(claude_pid)}")
     else:
         try:
             f.unlink()

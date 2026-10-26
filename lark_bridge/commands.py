@@ -166,6 +166,12 @@ def _enable(sid: str, b, ignored: str = "", pid=None) -> str:
     b.cwd = os.getcwd()
     state.save_binding(b)
     state.set_enabled(sid, True, pid)
+    if not state.is_enabled(sid):
+        feishu.log_error(f"enable {sid}: start time of claude pid {pid} unreadable")
+        return _result(
+            f"读不到 claude 进程（pid {pid}）的启动时间，无法开启桥接；"
+            "请把 `claude-lark doctor` 的输出反馈给开发者。"
+        )
     listener.ensure_running()
     sent = feishu.send(b.chat_id, f"已连接：{b.cwd}，会话 {sid[:8]}")
     msg = f"已开启桥接，群 {b.chat_name}。{HINT}"

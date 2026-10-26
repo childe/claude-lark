@@ -18,6 +18,25 @@ def pid_alive(pid):
     return True
 
 
+def start_time(pid) -> str:
+    """进程启动时间（`ps -o lstart=`，C locale，空白归一）；取不到返回空串。
+
+    和 pid 一起记下来：pid 会被复用（比如重启之后），启动时间不会一样。"""
+    if not pid or pid <= 0:
+        return ""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={**os.environ, "LC_ALL": "C"},
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return " ".join(out.split())
+
+
 def _ps(fields: str, pid: int) -> str:
     """ps -o <f1>= -o <f2>= ... -p <pid> 的输出（无表头）；出错返回空串。
 

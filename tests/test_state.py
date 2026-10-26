@@ -158,3 +158,36 @@ def test_consume_non_string_id(lark_home):
     state.append_inbox(SID, {"message_id": 7, "text": "x", "create_time": 1})
     state.consume(SID, [7])
     assert _texts() == []
+
+
+# ---------------- final review: pid reuse
+
+
+def test_set_enabled_records_claude_start_time(lark_home):
+    state.set_enabled(SID, True, os.getpid())
+    content = (lark_home / "sessions" / SID / "enabled").read_text()
+    pid, start = content.split("\n", 1)
+    assert int(pid) == os.getpid()
+    assert start.strip() and start.strip() == procs.start_time(os.getpid())
+    assert state.is_enabled(SID)
+
+
+def test_enabled_false_when_pid_reused_by_another_process(lark_home):
+    """重启后旧 claude 的 pid 被别的进程占用：pid 活着但启动时间对不上。"""
+    f = lark_home / "sessions" / SID / "enabled"
+    f.parent.mkdir(parents=True)
+    f.write_text(f"{os.getpid()}\nThu Jan  1 00:00:00 1970")
+    assert state.is_enabled(SID) is False
+    assert not f.exists()
+
+
+def test_enabled_old_pid_only_format_is_not_enabled(lark_home):
+    f = lark_home / "sessions" / SID / "enabled"
+    f.parent.mkdir(parents=True)
+    f.write_text(str(os.getpid()))
+    assert state.is_enabled(SID) is False
+
+
+def test_start_time_of_dead_pid_is_empty():
+    assert procs.start_time(999999) == ""
+    assert procs.start_time(None) == ""
