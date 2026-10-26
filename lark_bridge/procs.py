@@ -18,11 +18,17 @@ def pid_alive(pid):
     return True
 
 
-def _ps(field: str, pid: int) -> str:
-    """ps -o <field>= -p <pid> 的输出；出错返回空串。"""
+def _ps(fields: str, pid: int) -> str:
+    """ps -o <f1>= -o <f2>= ... -p <pid> 的输出（无表头）；出错返回空串。
+
+    每个字段要单独一个 `-o f=`：`-o ppid,comm=` 只去掉最后一列的表头，
+    输出会多一行 "PPID"。"""
+    opts = []
+    for f in fields.split(","):
+        opts += ["-o", f + "="]
     try:
         return subprocess.run(
-            ["ps", "-o", field + "=", "-p", str(pid)],
+            ["ps", *opts, "-p", str(pid)],
             capture_output=True,
             text=True,
             timeout=5,

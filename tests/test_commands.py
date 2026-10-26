@@ -302,3 +302,28 @@ def test_find_claude_ancestor_recognises_node(monkeypatch):
     table[500] = ("600", "/usr/bin/node", "node /x/server.js")
     table[600] = ("1", "launchd", "")
     assert procs.find_claude_ancestor() is None
+
+
+def test_find_claude_ancestor_real_ps(tmp_path):
+    """不 mock ps：真实进程树里祖先进程名为 claude 时要能找到它。
+
+    回归：`ps -o ppid,comm=` 会输出 PPID 表头行，导致永远找不到。"""
+    import subprocess
+    import sys
+
+    from lark_bridge import procs
+
+    claude = tmp_path / "claude"
+    claude.symlink_to("/bin/bash")
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    code = "from lark_bridge import procs; print(procs.find_claude_ancestor())"
+    # 末尾的 `; echo $$` 让 bash 不能 exec 掉自己，并打印 bash 自己的 pid
+    out = subprocess.run(
+        [str(claude), "-c", f'"{sys.executable}" -c "{code}"; echo $$'],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    ).stdout.split()
+    assert out[0] == out[1]
+    assert procs._ps("ppid,comm", os.getpid()).split()[0].isdigit()
