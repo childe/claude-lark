@@ -22,6 +22,9 @@ _ENTRIES = [
     # matcher 必须精确，更宽的 matcher 会自动放行任意工具
     ("PreToolUse", "AskUserQuestion", "ask", 3600),
     ("UserPromptSubmit", None, "prompt", 30),
+    # /clear、/resume、退出时断开桥接；不阻塞，超时给短一点
+    ("SessionStart", None, "session-start", 10),
+    ("SessionEnd", None, "session-end", 10),
 ]
 
 
@@ -125,7 +128,7 @@ def remove(cfg: dict) -> dict:
 
 
 def has_hooks(cfg: dict) -> bool:
-    """四个事件是否都已注册本项目的 hook。"""
+    """所有事件是否都已注册本项目的 hook。"""
     hooks = cfg.get("hooks") if isinstance(cfg, dict) else None
     if not isinstance(hooks, dict):
         return False

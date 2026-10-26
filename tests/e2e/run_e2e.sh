@@ -514,9 +514,84 @@ s8() {
     fi
 }
 
+# 桥接开着、会话回到终端（Stop hook 不在等待）。桥接没开就先 /lark 重新开启。
+bridged_at_terminal() {
+    local sd n0
+    sd="$(sdir)"
+    if [ ! -e "$sd/enabled" ]; then
+        n0=$(log_lines)
+        send_text "/lark"
+        if ! wait_for $TIMEOUT sent_since "$n0" "已连接"; then
+            echo "群里没有收到 已连接"
+            return 1
+        fi
+    fi
+    if ! wait_idle_bridged; then
+        echo "Stop hook 没有进入等待"
+        return 1
+    fi
+    tmux send-keys -t "$TMUX_S" Escape
+    if ! wait_for 15 no_stop_hook; then
+        echo "Esc 后 Stop hook 仍在运行"
+        return 1
+    fi
+    sleep 1
+    [ -e "$sd/enabled" ] || { echo "enabled 不存在"; return 1; }
+}
+
+s11() {
+    # /compact 是同一个活着的会话：SessionStart(source=compact) 不能断开桥接
+    local sd why sid0
+    sd="$(sdir)"
+    sid0="$(session_id)"
+    if ! why="$(bridged_at_terminal)"; then
+        fail "11 /compact 保留桥接" "$why"
+        return
+    fi
+    send_text "/compact"
+    compacted() { pane | grep -qi "compacted"; }
+    if ! wait_for 180 compacted; then
+        fail "11 /compact 保留桥接" "终端没有出现 Compacted"
+        return
+    fi
+    sleep 3
+    if [ ! -e "$sd/enabled" ]; then
+        fail "11 /compact 保留桥接" "compact 之后 enabled 消失了"
+    elif [ "$(ls "$CLAUDE_LARK_HOME/sessions" | wc -l | tr -d ' ')" != 1 ] || [ "$(session_id)" != "$sid0" ]; then
+        fail "11 /compact 保留桥接" "出现了别的 session 目录"
+    else
+        pass "11 /compact 保留桥接（enabled 仍在）"
+    fi
+}
+
+s10() {
+    # /clear 后旧会话的 SessionEnd 断开桥接并告知群里
+    local sd why n0
+    sd="$(sdir)"
+    if ! why="$(bridged_at_terminal)"; then
+        fail "10 /clear 断开桥接" "$why"
+        return
+    fi
+    n0=$(log_lines)
+    send_text "/clear"
+    if ! wait_for 30 test ! -e "$sd/enabled"; then
+        fail "10 /clear 断开桥接" "/clear 后 enabled 仍在"
+        return
+    fi
+    if ! wait_for 30 sent_since "$n0" "会话已结束（/clear 或退出），桥接已断开。终端里敲 /lark 可重新连接"; then
+        fail "10 /clear 断开桥接" "群里没有收到 会话已结束 的通知：$(sends_since "$n0" | tr '\n' ' ')"
+        return
+    fi
+    if [ ! -f "$sd/binding.json" ]; then
+        fail "10 /clear 断开桥接" "binding.json 被删了"
+        return
+    fi
+    pass "10 /clear 断开桥接（enabled 消失，群里收到通知，绑定保留）"
+}
+
 s1
 if [ "$FAILED" -eq 0 ]; then
-    for s in 9 2 3 4 5 7 6 8; do
+    for s in 9 2 3 4 5 7 6 8 11 10; do
         want "$s" && "s$s"
     done
 fi

@@ -383,3 +383,107 @@ def test_bin_real_sigterm_while_waiting(bridged):
     state.append_inbox(SID, msg(1, "after", "1"))
     assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["after"]
     assert state.get_counter(SID, "blocks") == 0
+
+
+# ---------------- final review: SessionStart / SessionEnd
+
+
+def session_input(event, field, value, sid=SID):
+    return json.dumps(
+        {
+            "session_id": sid,
+            "transcript_path": "/x.jsonl",
+            "cwd": "/work",
+            "hook_event_name": event,
+            field: value,
+        }
+    )
+
+
+@pytest.mark.parametrize("reason", ["clear", "resume", "prompt_input_exit", "other"])
+def test_session_end_disables_and_notifies(bridged, reason):
+    clock = Clock()
+    out = hooks.run(
+        "session-end",
+        session_input("SessionEnd", "reason", reason),
+        clock.now,
+        clock.sleep,
+    )
+    assert out == ""
+    assert not state.is_enabled(SID)
+    assert state.load_binding(SID) is not None  # 绑定保留
+    assert sent_texts(bridged()) == [hooks.MSG_SESSION_ENDED]
+    assert hooks.MSG_SESSION_ENDED == (
+        "会话已结束（/clear 或退出），桥接已断开。终端里敲 /lark 可重新连接"
+    )
+    assert clock.sleeps == 0
+
+
+def test_session_end_disables_even_without_binding(fake):
+    state.set_enabled(SID, True)
+    clock = Clock()
+    out = hooks.run(
+        "session-end",
+        session_input("SessionEnd", "reason", "clear"),
+        clock.now,
+        clock.sleep,
+    )
+    assert out == "" and not state.is_enabled(SID) and fake() == []
+
+
+@pytest.mark.parametrize("source", ["startup", "resume", "clear"])
+def test_session_start_disables_silently(bridged, source):
+    clock = Clock()
+    out = hooks.run(
+        "session-start",
+        session_input("SessionStart", "source", source),
+        clock.now,
+        clock.sleep,
+    )
+    assert out == ""
+    assert not state.is_enabled(SID)
+    assert bridged() == []
+
+
+@pytest.mark.parametrize("source", ["compact", "fork", None, 42])
+def test_session_start_keeps_bridge_on_compact(bridged, source):
+    """compact 是同一个活着的会话在压缩上下文，桥接必须保留。"""
+    clock = Clock()
+    out = hooks.run(
+        "session-start",
+        session_input("SessionStart", "source", source),
+        clock.now,
+        clock.sleep,
+    )
+    assert out == ""
+    assert state.is_enabled(SID)
+    assert bridged() == []
+
+
+def test_session_hooks_noop_when_not_bridged(fake):
+    clock = Clock()
+    for ev, field, value in (
+        ("session-start", "source", "startup"),
+        ("session-end", "reason", "other"),
+    ):
+        assert (
+            hooks.run(ev, session_input("X", field, value), clock.now, clock.sleep)
+            == ""
+        )
+    assert fake() == []
+    assert not (state.paths.home() / "sessions").exists()
+
+
+def test_bin_session_end_subprocess(bridged):
+    root = Path(__file__).resolve().parent.parent
+    r = subprocess.run(
+        [sys.executable, str(root / "bin" / "claude-lark"), "hook", "session-end"],
+        input=session_input("SessionEnd", "reason", "clear"),
+        capture_output=True,
+        text=True,
+        env=os.environ.copy(),
+        timeout=30,
+    )
+    assert r.returncode == 0 and r.stdout == "" and r.stderr == ""
+    assert not state.is_enabled(SID)
+    assert sent_texts(bridged()) == [hooks.MSG_SESSION_ENDED]

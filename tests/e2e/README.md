@@ -33,6 +33,8 @@ E2E_ONLY="2 3" tests/e2e/run_e2e.sh   # 只跑部分场景（场景 1 总会先�
 7. 非 owner 发消息 → 不进收件箱、没有新回合
 8. 群里 `/off` → 绑定保留、`enabled` 消失，下一轮 Stop hook 不阻塞也不发消息
 9. 续命：空闲 20 秒后出现一次 waiting 回合，群里不会收到 "waiting"
+10. `/clear` → 旧会话的 SessionEnd 删掉 `enabled`，群里收到"会话已结束（/clear 或退出），桥接已断开…"，绑定保留
+11. `/compact` → SessionStart(source=compact) 不断开，`enabled` 仍在（场景 10、11 在桥接没开时会先 `/lark` 重新开启）
 
 每个场景打印 `PASS` / `FAIL <原因>`；失败时打印终端最后 30 行、`errors.log` 和假 lark-cli 日志。
 退出时（trap）关掉 tmux 会话、监听进程和残留的 hook 进程。

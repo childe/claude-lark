@@ -93,7 +93,7 @@ What `install.sh` does, and what you should see (it is idempotent; run it again 
 1. Checks `python3` >= 3.9 and `lark-cli`. Failure: a line starting with `❌` and exit code 1, nothing is changed.
 2. Validates your `~/.claude/settings.json` before touching anything. A hand-broken file aborts the install untouched.
 3. Symlinks the repo to `~/.claude/lark/app` and `commands/lark.md` to `~/.claude/commands/lark.md`.
-4. Merges four hooks (`Stop`, `PermissionRequest`, `PreToolUse` with matcher `AskUserQuestion`, `UserPromptSubmit`) and the env var `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP=1000` into `~/.claude/settings.json`, leaving everything else as it was. Output: `已更新 ... （已备份到 ...）` or `无需改动`.
+4. Merges six hooks (`Stop`, `PermissionRequest`, `PreToolUse` with matcher `AskUserQuestion`, `UserPromptSubmit`, `SessionStart`, `SessionEnd`) and the env var `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP=1000` into `~/.claude/settings.json`, leaving everything else as it was. Output: `已更新 ... （已备份到 ...）` or `无需改动`.
 5. Records the logged-in Feishu user as the only allowed owner: `已写入 ~/.claude/lark/config.json`.
 6. Runs `claude-lark doctor`. Every line should start with `✅` and the last line should be `全部通过`. A `❌` line is followed by a `修复：` line telling you what to do; install itself still succeeds.
 
@@ -174,6 +174,7 @@ you want syncing to stop.
 - **One listener per Feishu app.** A Feishu app's message events must not be consumed by another machine or program at the same time, or each side receives only part of the messages. Use a separate app per machine, or stop the other consumer.
 - **Keep-alive limit of about 41 days.** To stay in the waiting state, the Stop hook keeps blocking turn after turn (cap 1000, with a reminder at the 950th); after about 41 days of continuous waiting the session will end the wait and you need to `/lark` again.
 - **Resume does not reconnect automatically.** After `claude --resume` the group binding is remembered, but you must type `/lark` to turn the bridge on again (if you resumed in the terminal, you are at the computer).
+- **`/clear`, `/resume` and exiting disconnect.** When the bridged conversation ends (`/clear`, switching with `/resume`, or quitting claude), the bridge is turned off and the group gets a notice: 会话已结束（/clear 或退出），桥接已断开。终端里敲 /lark 可重新连接. `/compact` keeps the bridge.
 - **No remote start.** Feishu cannot start `claude`. After a reboot, run `claude --resume` at the computer first.
 - **Single user.** Only the bound owner is listened to; no multi-person collaboration.
 - **Final replies only.** No mid-turn progress (commands run, files read) is sent.

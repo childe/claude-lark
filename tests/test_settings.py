@@ -36,7 +36,14 @@ def _foreign():
 def test_merge_into_empty():
     cfg = settings.merge({})
     hooks = cfg["hooks"]
-    assert set(hooks) == {"Stop", "PermissionRequest", "PreToolUse", "UserPromptSubmit"}
+    assert set(hooks) == {
+        "Stop",
+        "PermissionRequest",
+        "PreToolUse",
+        "UserPromptSubmit",
+        "SessionStart",
+        "SessionEnd",
+    }
     assert hooks["PermissionRequest"][0]["matcher"] == "*"
     assert "matcher" not in hooks["Stop"][0]
     assert "matcher" not in hooks["UserPromptSubmit"][0]
@@ -52,7 +59,7 @@ def test_merge_into_empty():
         "hook permission"
     )
     assert cfg["env"] == {"CLAUDE_CODE_STOP_HOOK_BLOCK_CAP": "1000"}
-    assert len(_ours(cfg)) == 4
+    assert len(_ours(cfg)) == 6
 
 
 def test_ask_matcher_is_exactly_ask_user_question():
@@ -66,7 +73,7 @@ def test_merge_idempotent():
     once = settings.merge(_foreign())
     twice = settings.merge(copy.deepcopy(once))
     assert once == twice
-    assert len(_ours(twice)) == 4
+    assert len(_ours(twice)) == 6
 
 
 def test_merge_does_not_mutate_input():
@@ -78,7 +85,7 @@ def test_merge_does_not_mutate_input():
 
 def test_merge_preserves_foreign_hooks():
     cfg = settings.merge(_foreign())
-    assert cfg["hooks"]["SessionStart"] == _foreign()["hooks"]["SessionStart"]
+    assert cfg["hooks"]["SessionStart"][0] == _foreign()["hooks"]["SessionStart"][0]
     stop = cfg["hooks"]["Stop"]
     assert stop[0] == _foreign()["hooks"]["Stop"][0]
     assert len(stop) == 2
@@ -104,7 +111,7 @@ def test_merge_replaces_tilde_spelling():
         }
     }
     cfg = settings.merge(old)
-    assert len(_ours(cfg)) == 4
+    assert len(_ours(cfg)) == 6
     assert cfg["hooks"]["Stop"][0]["hooks"][0]["timeout"] == 3600
 
 
@@ -324,3 +331,38 @@ def test_has_hooks_checks_matcher():
     cfg = settings.merge({})
     cfg["hooks"]["PermissionRequest"][0]["matcher"] = "Bash"
     assert not settings.has_hooks(cfg)
+
+
+# ---------------- final review: session start / end
+
+
+def test_merge_registers_session_start_and_end():
+    hooks = settings.merge({})["hooks"]
+    for event, sub in (
+        ("SessionStart", "session-start"),
+        ("SessionEnd", "session-end"),
+    ):
+        assert hooks[event] == [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f"$HOME/.claude/lark/app/bin/claude-lark hook {sub}",
+                        "timeout": 10,
+                    }
+                ]
+            }
+        ]
+    # 已有的别人的 SessionStart 条目保留，我们的单独一组
+    merged = settings.merge(_foreign())["hooks"]["SessionStart"]
+    assert merged[0]["hooks"][0]["command"] == "sh superpowers.sh"
+    assert len(merged) == 2
+
+
+def test_has_hooks_requires_session_hooks():
+    for event in ("SessionStart", "SessionEnd"):
+        cfg = settings.merge({})
+        del cfg["hooks"][event]
+        assert not settings.has_hooks(cfg)
+    cfg = settings.remove(settings.merge({}))
+    assert "hooks" not in cfg

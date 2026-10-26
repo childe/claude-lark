@@ -31,6 +31,10 @@ MSG_PERM_TIMEOUT = "等待超时，已交回终端"
 MSG_PERM_TERMINAL = "已在终端处理"
 MSG_ASK_HANDBACK = "已交回终端"
 DENY_MESSAGE = "用户在飞书上拒绝了"
+MSG_SESSION_ENDED = "会话已结束（/clear 或退出），桥接已断开。终端里敲 /lark 可重新连接"
+# 这些 SessionStart 来源意味着"换了一段对话"：resume 不自动接回飞书（spec 第 9 节）。
+# compact 是同一个活着的会话在压缩上下文，不能断开。
+_START_DISCONNECT = ("startup", "resume", "clear")
 # UserPromptSubmit 会卡住终端，发送不能等太久；SIGTERM 之后的告知同理
 SHORT_SEND_TIMEOUT = 5
 
@@ -302,6 +306,35 @@ def _ask(sid, data, binding, deadline, now, sleep) -> str:
     )
 
 
+def _session_end(sid, data) -> str:
+    """SessionEnd（/clear、/resume 切走、退出）：断开桥接并告知群里。
+
+    claude 进程在 /clear 后还活着，不断开的话监听进程会继续往这个
+    已经不会再被读的收件箱里投消息，消息就悄悄丢了。"""
+    state.set_enabled(sid, False)
+    feishu.log_error(f"session {sid} ended ({data.get('reason')}), bridge disabled")
+    b = state.load_binding(sid)
+    if b is not None:
+        feishu.send(b.chat_id, MSG_SESSION_ENDED, timeout=SHORT_SEND_TIMEOUT)
+    return ""
+
+
+def _session_start(sid, data) -> str:
+    """SessionStart：一个已开启的 session_id 以 startup/resume/clear 开始，静默断开。"""
+    if data.get("source") in _START_DISCONNECT:
+        state.set_enabled(sid, False)
+        feishu.log_error(
+            f"session {sid} started ({data.get('source')}), stale bridge disabled"
+        )
+    return ""
+
+
+# 不需要绑定、也不阻塞的 hook
+_SESSION_HANDLERS = {
+    "session-start": _session_start,
+    "session-end": _session_end,
+}
+
 _HANDLERS = {
     "stop": _stop,
     "prompt": _prompt,
@@ -353,9 +386,12 @@ def run(
             paths.session_dir(sid)
         except ValueError:
             return ""
+        session_handler = _SESSION_HANDLERS.get(event)
         handler = _HANDLERS.get(event)
-        if handler is None or not state.is_enabled(sid):
+        if (handler is None and session_handler is None) or not state.is_enabled(sid):
             return ""
+        if session_handler is not None:
+            return session_handler(sid, data)
         binding = state.load_binding(sid)
         if binding is None:
             feishu.log_error(f"hook {event}: session {sid} enabled but has no binding")
