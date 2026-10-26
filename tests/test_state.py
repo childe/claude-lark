@@ -90,3 +90,13 @@ def test_procs():
     assert not procs.pid_alive(999999)
     r = procs.find_claude_ancestor()
     assert r is None or isinstance(r, int)
+
+
+def test_append_repairs_partial_trailing_line(lark_home):
+    state.append_inbox(SID, {"message_id": "om_test_1", "text": "a", "create_time": 1})
+    p = lark_home / "sessions" / SID / "inbox.jsonl"
+    with open(p, "a") as f:
+        f.write('{"message_id": "om_test_2", "te')
+    state.append_inbox(SID, {"message_id": "om_test_3", "text": "c", "create_time": 3})
+    msgs, _ = state.peek_inbox(SID)
+    assert [m["message_id"] for m in msgs] == ["om_test_1", "om_test_3"]

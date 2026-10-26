@@ -1,5 +1,7 @@
 """Reply parsing and Feishu message templates. Pure functions, no I/O."""
 
+from __future__ import annotations
+
 import json
 import re
 

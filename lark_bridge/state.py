@@ -105,13 +105,17 @@ def append_inbox(sid, msg: dict):
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
             f.seek(0)
-            for line in f.read().split(b"\n"):
+            data = f.read()
+            for line in data.split(b"\n"):
                 try:
                     if json.loads(line).get("message_id") == msg["message_id"]:
                         return
                 except (ValueError, AttributeError):
                     continue
             f.seek(0, os.SEEK_END)
+            if data and not data.endswith(b"\n"):
+                # 修复被截断的上一行，否则它会吞掉这条消息
+                f.write(b"\n")
             f.write((json.dumps(msg, ensure_ascii=False) + "\n").encode())
             f.flush()
         finally:
