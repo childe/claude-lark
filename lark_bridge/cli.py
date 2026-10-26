@@ -17,10 +17,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 def _hook(event: str) -> int:
     """hook 入口：读 stdin，输出 hooks.run 的结果，永远 exit 0。"""
+    saved = None
     try:
+        import signal
+
         from . import hooks
 
-        out = hooks.run(event, sys.stdin.read())
+        # 事先装上 hooks 的处理函数：run() 结束时恢复的仍是它，且 hold_sigterm
+        # 让它保持"只记录"，结果写完 stdout 之前 SIGTERM 不会打断
+        try:
+            saved = (signal.signal(signal.SIGTERM, hooks._on_sigterm),)
+        except (ValueError, OSError):
+            pass
+        out = hooks.run(event, sys.stdin.read(), hold_sigterm=True)
         if out:
             sys.stdout.write(out + "\n")
             sys.stdout.flush()
@@ -32,6 +41,13 @@ def _hook(event: str) -> int:
 
             with open(paths.home() / "errors.log", "a") as f:
                 f.write(f"hook {event} (cli): {traceback.format_exc()}\n")
+        except BaseException:
+            pass
+    finally:
+        try:
+            if saved is not None:
+                signal.signal(signal.SIGTERM, saved[0])
+            hooks._term["defer"] = False
         except BaseException:
             pass
     return 0

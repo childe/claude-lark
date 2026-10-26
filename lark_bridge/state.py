@@ -1,5 +1,6 @@
 """会话状态：绑定、开关、收件箱与游标、计数器、群占用。"""
 
+import contextlib
 import fcntl
 import json
 import os
@@ -207,8 +208,42 @@ def peek_inbox(sid, since: int = 0):
     return msgs, offset
 
 
+@contextlib.contextmanager
+def _consumed_lock(sid):
+    """游标与 consumed.txt 的读-改-写都在这把锁里做（持有时间很短）。"""
+    p = paths.session_dir(sid) / "consumed.lock"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def try_lock_interactive(sid):
+    """非阻塞地拿会话的交互锁（权限 / 提问 hook 串行）。拿到返回文件对象（close 即释放），否则 None。"""
+    p = paths.session_dir(sid) / "interactive.lock"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    f = open(p, "a+")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.close()
+        return None
+    except BaseException:
+        f.close()
+        raise
+    return f
+
+
 def commit_cursor(sid, offset: int):
     """游标前移到 offset，并从 consumed 集合里删掉被游标越过的 id。"""
+    with _consumed_lock(sid):
+        _commit_cursor_locked(sid, offset)
+
+
+def _commit_cursor_locked(sid, offset: int):
     passed = {_mid(m) for m, _, end in _scan(sid)[0] if m is not None and end <= offset}
     _atomic_write(paths.session_dir(sid) / "inbox.cursor", str(offset))
     consumed = _consumed(sid)
@@ -220,16 +255,17 @@ def consume(sid, message_ids):
     """把这些消息标记为已消费（不再被 peek 到），再把游标推过开头连续的已消费行。
 
     用于权限 / 提问的回复：它们不一定在游标处，不能直接 commit 偏移。"""
-    consumed = _consumed(sid) | {str(x) for x in message_ids}
-    _write_consumed(sid, consumed)
-    rows, _ = _scan(sid)
-    offset = None
-    for m, _, end in rows:
-        if m is not None and _mid(m) not in consumed:
-            break
-        offset = end
-    if offset is not None:
-        commit_cursor(sid, offset)
+    with _consumed_lock(sid):
+        consumed = _consumed(sid) | {str(x) for x in message_ids}
+        _write_consumed(sid, consumed)
+        rows, _ = _scan(sid)
+        offset = None
+        for m, _, end in rows:
+            if m is not None and _mid(m) not in consumed:
+                break
+            offset = end
+        if offset is not None:
+            _commit_cursor_locked(sid, offset)
 
 
 def get_counter(sid, name) -> int:

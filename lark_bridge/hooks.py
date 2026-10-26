@@ -159,7 +159,39 @@ def _prompt(sid, data, binding, start, now, sleep) -> str:
     return ""
 
 
-def _permission(sid, data, binding, start, now, sleep) -> str:
+def _acquire_interactive(sid, deadline: float, now, sleep):
+    """轮询拿交互锁。拿到 → 文件对象；到 deadline 或桥接被关闭 → None。
+    SIGTERM 时 HookTerminated 从 sleep 里向上抛出。"""
+    while True:
+        lock = state.try_lock_interactive(sid)
+        if lock is not None:
+            return lock
+        t = now()
+        if t >= deadline or not state.is_enabled(sid):
+            return None
+        sleep(min(POLL_SECONDS, deadline - t))
+
+
+def _serialized(inner):
+    """同一会话的权限 / 提问 hook 串行执行（Claude 可能并行调用工具）。
+
+    锁从取收件箱边界之前一直持有到最终 consume 之后，
+    这样一条"同意"只会被一个 hook 用掉，后一个 hook 的边界也在它之后。"""
+
+    def handler(sid, data, binding, start, now, sleep):
+        deadline = start + wait_seconds()
+        lock = _acquire_interactive(sid, deadline, now, sleep)
+        if lock is None:
+            return ""
+        try:
+            return inner(sid, data, binding, deadline, now, sleep)
+        finally:
+            lock.close()
+
+    return handler
+
+
+def _permission(sid, data, binding, deadline, now, sleep) -> str:
     chat = binding.chat_id
     tool_input = data.get("tool_input")
     if not isinstance(tool_input, dict):
@@ -167,7 +199,6 @@ def _permission(sid, data, binding, start, now, sleep) -> str:
     # 只有提示发出之后才到达的消息算回复；之前积压的留给 Stop hook
     since = state.inbox_size(sid)
     feishu.send(chat, format_permission(str(data.get("tool_name")), tool_input))
-    deadline = start + wait_seconds()
     try:
         while True:
             msgs = wait_for_messages(sid, deadline, now, sleep, since)
@@ -201,14 +232,14 @@ def _permission(sid, data, binding, start, now, sleep) -> str:
                 )
             # 整批都不是明确的同意/拒绝：消费掉，提示后继续等
             state.consume(sid, done)
-            feishu.send(chat, MSG_PERM_HINT)
+            feishu.send(chat, MSG_PERM_HINT, timeout=SHORT_SEND_TIMEOUT)
     except HookTerminated:
         # 用户在终端处理了确认框
         feishu.send(chat, MSG_PERM_TERMINAL, timeout=SHORT_SEND_TIMEOUT)
         return ""
 
 
-def _ask(sid, data, binding, start, now, sleep) -> str:
+def _ask(sid, data, binding, deadline, now, sleep) -> str:
     chat = binding.chat_id
     tool_input = data.get("tool_input")
     questions = tool_input.get("questions") if isinstance(tool_input, dict) else None
@@ -224,7 +255,7 @@ def _ask(sid, data, binding, start, now, sleep) -> str:
     since = state.inbox_size(sid)
     feishu.send(chat, format_questions(questions))
     try:
-        msgs = wait_for_messages(sid, start + wait_seconds(), now, sleep, since)
+        msgs = wait_for_messages(sid, deadline, now, sleep, since)
         if msgs is None:
             if state.is_enabled(sid):
                 feishu.send(chat, MSG_ASK_HANDBACK)
@@ -250,8 +281,8 @@ def _ask(sid, data, binding, start, now, sleep) -> str:
 _HANDLERS = {
     "stop": _stop,
     "prompt": _prompt,
-    "permission": _permission,
-    "ask": _ask,
+    "permission": _serialized(_permission),
+    "ask": _serialized(_ask),
 }
 
 
@@ -273,7 +304,16 @@ def _restore_sigterm(saved):
         pass
 
 
-def run(event: str, stdin_text: str, now=time.monotonic, sleep=time.sleep) -> str:
+def run(
+    event: str,
+    stdin_text: str,
+    now=time.monotonic,
+    sleep=time.sleep,
+    *,
+    hold_sigterm: bool = False,
+) -> str:
+    """hold_sigterm=True（cli 用）：返回后 SIGTERM 仍保持"只记录"，
+    直到调用方把结果写完 stdout，避免已 commit 的结果在写出前丢失。"""
     start = now()
     saved = None
     _term["defer"] = _term["pending"] = False
@@ -304,5 +344,8 @@ def run(event: str, stdin_text: str, now=time.monotonic, sleep=time.sleep) -> st
         feishu.log_exception(f"hook {event}")
         return ""
     finally:
+        # 先切到"只记录"，再恢复旧处理函数：cli 事先装的就是 _on_sigterm
+        _term["defer"] = True
         _restore_sigterm(saved)
-        _term["defer"] = _term["pending"] = False
+        _term["pending"] = False
+        _term["defer"] = hold_sigterm

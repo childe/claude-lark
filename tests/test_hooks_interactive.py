@@ -513,3 +513,165 @@ def test_bin_permission_real_sigterm(bridged):
     out, err = p.stdout.read(), p.stderr.read()
     assert p.returncode == 0 and out == "" and err == ""
     assert sent_texts(bridged())[-1] == "已在终端处理"
+
+
+# ------------------------------------------------ fix round: concurrency etc.
+
+
+def _hold_interactive_lock():
+    import fcntl
+
+    p = state.paths.session_dir(SID) / "interactive.lock"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    f = open(p, "a+")
+    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return f
+
+
+@pytest.mark.parametrize("event", ["permission", "ask"])
+def test_interactive_lock_wait_respects_deadline(bridged, monkeypatch, event):
+    monkeypatch.setenv("CLAUDE_LARK_WAIT_SECONDS", "3")
+    held = _hold_interactive_lock()
+    try:
+        clock = Clock(arrive((1, msg(1, "同意", "1"))))
+        start = clock.t
+        inp = perm_input() if event == "permission" else ask_input()
+        assert hooks.run(event, inp, clock.now, clock.sleep) == ""
+        assert clock.t == pytest.approx(start + 3)
+        assert sent_texts(bridged()) == []  # never prompted
+        assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["同意"]
+    finally:
+        held.close()
+
+
+@pytest.mark.parametrize("event", ["permission", "ask"])
+def test_interactive_lock_wait_sigterm(bridged, event):
+    held = _hold_interactive_lock()
+    try:
+
+        def on_sleep(c):
+            if c.sleeps == 2:
+                hooks._on_sigterm(signal.SIGTERM, None)
+
+        clock = Clock(on_sleep)
+        inp = perm_input() if event == "permission" else ask_input()
+        assert hooks.run(event, inp, clock.now, clock.sleep) == ""
+        assert clock.sleeps == 2
+        assert sent_texts(bridged()) == []
+    finally:
+        held.close()
+
+
+def test_interactive_lock_released_after_hook(bridged):
+    clock = Clock(arrive((1, msg(1, "同意", "1"))))
+    hooks.run("permission", perm_input(), clock.now, clock.sleep)
+    _hold_interactive_lock().close()  # would raise BlockingIOError if still held
+
+
+def test_two_concurrent_permission_hooks_one_reply_allows_one(bridged, monkeypatch):
+    import os
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
+    monkeypatch.setenv("CLAUDE_LARK_WAIT_SECONDS", "30")
+    root = Path(__file__).resolve().parent.parent
+
+    def spawn(cmd):
+        p = subprocess.Popen(
+            [sys.executable, str(root / "bin" / "claude-lark"), "hook", "permission"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=os.environ.copy(),
+        )
+        p.stdin.write(perm_input(tool_input={"command": cmd}))
+        p.stdin.close()
+        return p
+
+    def wait_until(cond, timeout=20):
+        deadline = time.time() + timeout
+        while not cond() and time.time() < deadline:
+            time.sleep(0.05)
+        assert cond()
+
+    def prompts():
+        return [t for t in sent_texts(bridged()) if t.startswith("Claude 想执行")]
+
+    a, b = spawn("echo A"), spawn("echo B")
+    wait_until(lambda: len(prompts()) >= 1)
+    time.sleep(1.0)  # give the other hook every chance to (wrongly) prompt too
+    assert len(prompts()) == 1
+    state.append_inbox(SID, msg(1, "同意", "1"))
+    wait_until(lambda: (a.poll() is not None) or (b.poll() is not None))
+    first, second = (a, b) if a.poll() is not None else (b, a)
+    assert json.loads(first.stdout.read())["hookSpecificOutput"]["decision"] == {
+        "behavior": "allow"
+    }
+    # the other one now prompts and keeps waiting; the old "同意" doesn't count
+    wait_until(lambda: len(prompts()) == 2)
+    time.sleep(1.0)
+    assert second.poll() is None
+    state.append_inbox(SID, msg(2, "拒绝", "2"))
+    second.wait(timeout=20)
+    out = json.loads(second.stdout.read())
+    assert out["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+    assert state.peek_inbox(SID)[0] == []
+
+
+def test_consumed_rewrite_is_locked(bridged):
+    import fcntl
+    import threading
+
+    state.append_inbox(SID, msg(1, "x", "1"))
+    p = state.paths.session_dir(SID) / "consumed.lock"
+    f = open(p, "a+")
+    fcntl.flock(f, fcntl.LOCK_EX)
+    t = threading.Thread(target=state.consume, args=(SID, ["om_test_1"]))
+    t.start()
+    t.join(0.3)
+    assert t.is_alive()  # blocked on the lock
+    assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["x"]
+    f.close()
+    t.join(5)
+    assert not t.is_alive()
+    assert state.peek_inbox(SID)[0] == []
+
+
+def test_ambiguous_hint_uses_short_timeout(bridged, monkeypatch):
+    seen = []
+    real = feishu._run
+
+    def spy(args, timeout=feishu.TIMEOUT):
+        if "--markdown" in args:
+            seen.append((args[args.index("--markdown") + 1], timeout))
+        return real(args, timeout=timeout)
+
+    monkeypatch.setattr(feishu, "_run", spy)
+    clock = Clock(arrive((1, msg(1, "嗯", "1")), (3, msg(2, "同意", "2"))))
+    hooks.run("permission", perm_input(), clock.now, clock.sleep)
+    assert ("请回复「同意」或「拒绝」", 5) in seen
+    assert ("✅ 已允许", 5) in seen
+
+
+def test_cli_sigterm_after_run_does_not_lose_output(bridged, monkeypatch):
+    import io
+    import sys
+
+    from lark_bridge import cli
+
+    class SigtermOnWrite(io.StringIO):
+        def write(self, s):
+            hooks._on_sigterm(signal.SIGTERM, None)  # signal lands right here
+            return super().write(s)
+
+    state.append_inbox(SID, msg(1, "from cli", "1"))
+    out = SigtermOnWrite()
+    before = signal.getsignal(signal.SIGTERM)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(stop_input("r")))
+    monkeypatch.setattr(sys, "stdout", out)
+    assert cli.main(["hook", "stop"]) == 0
+    assert json.loads(out.getvalue())["reason"] == DELIVER_PREFIX + "from cli"
+    assert signal.getsignal(signal.SIGTERM) is before
