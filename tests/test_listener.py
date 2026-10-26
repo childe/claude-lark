@@ -26,7 +26,7 @@ def fake(lark_home, tmp_path, monkeypatch):
     monkeypatch.delenv("FAKE_LARK_FAIL", raising=False)
     monkeypatch.delenv("FAKE_LARK_SLEEP", raising=False)
     monkeypatch.delenv("FAKE_LARK_EVENTS", raising=False)
-    monkeypatch.delenv("FAKE_LARK_IGNORE_TERM", raising=False)
+    monkeypatch.delenv("FAKE_LARK_USER_SCOPE", raising=False)
     listener._notice_at.clear()
     listener._owner_missing["logged"] = False
 
@@ -68,6 +68,10 @@ def ev(**kw):
     }
     base.update(kw)
     return base
+
+
+def now_ms():
+    return str(int(time.time() * 1000))
 
 
 def inbox(sid=SID):
@@ -213,17 +217,9 @@ def _wait(cond, timeout=10):
     return False
 
 
-def _child_pids():
-    """listener.log 里记录的 lark-cli 子进程 pid。"""
-    try:
-        text = paths.listener_log().read_text()
-    except OSError:
-        return []
-    return [
-        int(line.rsplit("pid=", 1)[1].split()[0])
-        for line in text.splitlines()
-        if "started lark-cli pid=" in line
-    ]
+def _polls(fake):
+    """监听进程拉消息的次数（假 lark-cli 记下的 api 调用）。"""
+    return [c for c in fake() if c[:3] == ["api", "GET", "/open-apis/im/v1/messages"]]
 
 
 def _dead_pid():
@@ -241,8 +237,8 @@ def test_listener_main_exits_when_no_enabled_sessions(fake, tmp_path, monkeypatc
         [
             "not json at all",
             "[1, 2]",
-            json.dumps(ev(message_id="om_test_bad")),
-            json.dumps(ev(content="first")),
+            json.dumps(ev(message_id="om_test_bad", create_time=now_ms())),
+            json.dumps(ev(content="first", create_time=now_ms())),
         ],
     )
     real = listener.handle_event
@@ -264,7 +260,7 @@ def test_listener_main_exits_when_no_enabled_sessions(fake, tmp_path, monkeypatc
 
     th = threading.Thread(target=killer)
     th.start()
-    rc = listener.main(check_interval=0.1, restart_delay=0.1)
+    rc = listener.main(check_interval=0.1, poll_interval=0.1)
     th.join()
     claude.kill()
     claude.wait()
@@ -272,16 +268,17 @@ def test_listener_main_exits_when_no_enabled_sessions(fake, tmp_path, monkeypatc
     assert [m["text"] for m in inbox()] == ["first"]
     assert not state.is_enabled(SID)
     assert not paths.listener_pid_file().exists()
-    kids = _child_pids()
-    assert kids and all(not procs.pid_alive(k) for k in kids)
     assert "boom" in paths.listener_log().read_text()
-    consume = [c for c in fake() if c[:2] == ["event", "consume"]]
-    assert consume[0] == ["event", "consume", "im.message.receive_v1", "--as", "bot"]
+    poll = _polls(fake)[0]
+    assert poll[3:5] == ["--as", "user"]
+    assert (
+        json.loads(poll[poll.index("--params") + 1])["container_id"] == "oc_test_chat"
+    )
 
 
 def test_listener_main_exits_immediately_without_enabled_sessions(fake):
     bind(enabled=False)
-    assert listener.main(check_interval=0.1, restart_delay=0.1) == 0
+    assert listener.main(check_interval=0.1, poll_interval=0.1) == 0
     assert not paths.listener_pid_file().exists()
     assert fake() == []
 
@@ -301,7 +298,7 @@ def test_listener_single_instance(fake):
     other = _hold_listener_lock()
     try:
         assert listener.is_running()
-        assert listener.main(check_interval=0.1, restart_delay=0.1) == 0
+        assert listener.main(check_interval=0.1, poll_interval=0.1) == 0
     finally:
         other.close()
     assert fake() == []
@@ -309,22 +306,23 @@ def test_listener_single_instance(fake):
     assert paths.listener_pid_file().read_text() == str(os.getppid())
 
 
-def test_listener_restarts_crashed_lark_cli(fake, monkeypatch):
+def test_listener_keeps_polling_after_failures(fake, monkeypatch):
     monkeypatch.setenv("FAKE_LARK_FAIL", "1")
     claude = subprocess.Popen(["sleep", "60"])
     bind(claude_pid=claude.pid)
 
     def killer():
-        _wait(lambda: len(_child_pids()) >= 3)
+        _wait(lambda: len(_polls(fake)) >= 3)
         claude.kill()
         claude.wait()
 
     th = threading.Thread(target=killer)
     th.start()
-    assert listener.main(check_interval=0.1, restart_delay=0.1) == 0
+    assert listener.main(check_interval=0.1, poll_interval=0.1) == 0
     th.join()
-    assert len(_child_pids()) >= 3
-    assert "restarting" in paths.listener_log().read_text()
+    assert len(_polls(fake)) >= 3
+    # 连续失败只记一次
+    assert paths.listener_log().read_text().count("poll oc_test_chat failed") == 1
 
 
 def _env():
@@ -333,7 +331,7 @@ def _env():
 
 def test_listener_sigterm_and_cli(fake, tmp_path, monkeypatch):
     bind()
-    _write_events(tmp_path, monkeypatch, [json.dumps(ev())])
+    _write_events(tmp_path, monkeypatch, [json.dumps(ev(create_time=now_ms()))])
     p = subprocess.Popen(
         [sys.executable, str(BIN), "listen"],
         env=_env(),
@@ -342,8 +340,6 @@ def test_listener_sigterm_and_cli(fake, tmp_path, monkeypatch):
     try:
         assert _wait(lambda: inbox())
         assert paths.listener_pid_file().read_text().strip() == str(p.pid)
-        kids = _child_pids()
-        assert kids
         p.send_signal(signal.SIGTERM)
         assert p.wait(timeout=10) == 0
     finally:
@@ -351,7 +347,6 @@ def test_listener_sigterm_and_cli(fake, tmp_path, monkeypatch):
             p.kill()
             p.wait()
     assert not paths.listener_pid_file().exists()
-    assert _wait(lambda: all(not procs.pid_alive(k) for k in kids))
 
 
 def test_ensure_running_spawns_once(fake):
@@ -365,7 +360,7 @@ def test_ensure_running_spawns_once(fake):
         listener.ensure_running()
         time.sleep(0.5)
         assert int(pidf.read_text()) == pid
-        assert len(_child_pids()) == 1
+        assert paths.listener_log().read_text().count("listener started") == 1
     finally:
         try:
             os.kill(int(pidf.read_text()), signal.SIGTERM)
@@ -396,8 +391,8 @@ def test_listener_handler_error_asks_resend(fake, monkeypatch):
 def test_listener_logs_missing_owner_once(fake, lark_home):
     bind()
     (lark_home / "config.json").write_text("{}")
-    listener._process_line(json.dumps(ev()))
-    listener._process_line(json.dumps(ev(message_id="om_test_2")))
+    listener._process_event(ev())
+    listener._process_event(ev(message_id="om_test_2"))
     assert paths.listener_log().read_text().count("owner_open_id missing") == 1
     assert inbox() == []
 
@@ -426,7 +421,7 @@ def test_listener_keeps_running_if_enabled_during_shutdown(fake, monkeypatch):
     out = {}
     th = threading.Thread(
         target=lambda: out.setdefault(
-            "rc", listener.main(check_interval=0.1, restart_delay=0.1)
+            "rc", listener.main(check_interval=0.1, poll_interval=0.1)
         ),
         daemon=True,
     )
@@ -439,8 +434,8 @@ def test_listener_keeps_running_if_enabled_during_shutdown(fake, monkeypatch):
         time.sleep(0.3)
         assert th.is_alive()
         assert paths.listener_pid_file().read_text() == str(os.getpid())
-        kids = _child_pids()
-        assert len(kids) == 1 and procs.pid_alive(kids[0])
+        n = len(_polls(fake))
+        assert _wait(lambda: len(_polls(fake)) > n)
     finally:
         default["v"] = False
         th.join(10)
@@ -468,15 +463,15 @@ def test_ensure_running_waits_for_pid_lock(fake, monkeypatch):
     assert len(spawned) == 1 and spawned[0][-1] == "listen"
 
 
-def test_listener_kills_child_ignoring_sigterm(fake, monkeypatch):
-    monkeypatch.setenv("FAKE_LARK_IGNORE_TERM", "1")
-    monkeypatch.setattr(listener, "KILL_GRACE", 0.3)
+def test_listener_hung_poll_is_bounded(fake, monkeypatch):
+    """lark-cli 卡住不返回：单次拉取有超时，监听进程照样能退出。"""
+    monkeypatch.setenv("FAKE_LARK_SLEEP", "30")
+    monkeypatch.setattr(listener, "POLL_TIMEOUT", 0.5)
     claude = subprocess.Popen(["sleep", "60"])
     bind(claude_pid=claude.pid)
 
     def killer():
-        _wait(lambda: _child_pids())
-        time.sleep(0.3)  # 让子进程装好 SIG_IGN
+        _wait(lambda: _polls(fake))
         claude.kill()
         claude.wait()
 
@@ -485,23 +480,16 @@ def test_listener_kills_child_ignoring_sigterm(fake, monkeypatch):
     out = {}
     th = threading.Thread(
         target=lambda: out.setdefault(
-            "rc", listener.main(check_interval=0.1, restart_delay=0.1)
+            "rc", listener.main(check_interval=0.1, poll_interval=0.1)
         ),
         daemon=True,
     )
     th.start()
-    th.join(4)
+    th.join(8)
     k.join()
-    alive = th.is_alive()
-    for pid in _child_pids():
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
-    th.join(5)
-    assert not alive, "read loop stayed blocked on a child ignoring SIGTERM"
+    assert not th.is_alive(), "listener stayed blocked on a hung lark-cli"
     assert out["rc"] == 0
-    assert "ignored SIGTERM" in paths.listener_log().read_text()
+    assert "timed out" in paths.listener_log().read_text()
 
 
 # ---------- final review: pid reuse ----------
@@ -515,18 +503,18 @@ def test_stale_pid_file_with_reused_live_pid_does_not_block_listener(fake):
     assert not listener.is_running()
 
     def killer():
-        _wait(lambda: _child_pids())
+        _wait(lambda: _polls(fake))
         claude.kill()
         claude.wait()
 
     th = threading.Thread(target=killer)
     th.start()
-    rc = listener.main(check_interval=0.1, restart_delay=0.1)
+    rc = listener.main(check_interval=0.1, poll_interval=0.1)
     th.join()
     claude.kill()
     claude.wait()
     assert rc == 0
-    assert _child_pids(), "listener never started lark-cli"
+    assert _polls(fake), "listener never polled"
     assert not listener.is_running()
 
 
@@ -536,14 +524,14 @@ def test_listener_holds_lock_while_running(fake):
     seen = []
 
     def watcher():
-        _wait(lambda: _child_pids())
+        _wait(lambda: _polls(fake))
         seen.append(listener.is_running())
         claude.kill()
         claude.wait()
 
     th = threading.Thread(target=watcher)
     th.start()
-    listener.main(check_interval=0.1, restart_delay=0.1)
+    listener.main(check_interval=0.1, poll_interval=0.1)
     th.join()
     assert seen == [True]
     assert not listener.is_running()
@@ -563,3 +551,126 @@ def test_ensure_running_skips_spawn_while_lock_held(fake, monkeypatch):
     paths.listener_pid_file().write_text(str(os.getppid()))  # 活着但不是监听进程
     listener.ensure_running()
     assert len(spawned) == 1
+
+
+# ---------- polling as user ----------
+
+
+def _poll(poller):
+    poller.poll_once(threading.Event())
+
+
+def test_poller_skips_messages_before_enable(fake, tmp_path, monkeypatch):
+    bind()
+    old = str(int(time.time() * 1000) - 60_000)
+    p = _write_events(
+        tmp_path,
+        monkeypatch,
+        [json.dumps(ev(message_id="om_test_old", content="old", create_time=old))],
+    )
+    poller = listener._Poller(idle_interval=60)
+    _poll(poller)
+    assert inbox() == []
+    with open(p, "a") as f:
+        f.write(
+            json.dumps(
+                ev(message_id="om_test_new", content="new", create_time=now_ms())
+            )
+            + "\n"
+        )
+    _poll(poller)
+    _poll(poller)  # 同一条不重复投递
+    assert [m["text"] for m in inbox()] == ["new"]
+
+
+def test_poller_cursor_survives_restart(fake, tmp_path, monkeypatch):
+    bind()
+    _write_events(tmp_path, monkeypatch, [json.dumps(ev(create_time=now_ms()))])
+    _poll(listener._Poller(idle_interval=60))
+    _poll(listener._Poller(idle_interval=60))  # 新的监听进程读到持久化的游标
+    assert [m["text"] for m in inbox()] == ["hello"]
+    assert json.loads((paths.home() / "poll_cursors.json").read_text()) == {
+        "oc_test_chat": 1
+    }
+
+
+def test_poller_notices_disabled_chat_but_not_history(fake, tmp_path, monkeypatch):
+    bind(enabled=False)
+    old = str(int(time.time() * 1000) - 60_000)
+    p = _write_events(
+        tmp_path,
+        monkeypatch,
+        [json.dumps(ev(message_id="om_test_old", create_time=old))],
+    )
+    poller = listener._Poller(idle_interval=0)
+    _poll(poller)
+    assert sent_texts(fake()) == []
+    with open(p, "a") as f:
+        f.write(json.dumps(ev(message_id="om_test_new", create_time=now_ms())) + "\n")
+    _poll(poller)
+    assert sent_texts(fake()) == [listener.NOT_BRIDGED]
+    assert inbox() == []
+
+
+def test_poller_polls_disabled_chats_rarely(fake, tmp_path, monkeypatch):
+    bind(enabled=False)
+    _write_events(tmp_path, monkeypatch, [])
+    poller = listener._Poller(idle_interval=60)
+    _poll(poller)
+    _poll(poller)
+    assert len(_polls(fake)) == 1
+
+
+def test_poller_routes_post_and_strips_mentions(fake, tmp_path, monkeypatch):
+    bind()
+    _write_events(
+        tmp_path,
+        monkeypatch,
+        [
+            json.dumps(
+                ev(
+                    message_id="om_test_m",
+                    content="@_user_1 看下日志",
+                    mentions=[{"key": "@_user_1", "name": "test-bot"}],
+                    create_time=now_ms(),
+                )
+            ),
+            json.dumps(
+                ev(
+                    message_id="om_test_p",
+                    message_type="post",
+                    content="富文本",
+                    create_time=now_ms(),
+                )
+            ),
+            json.dumps(
+                ev(
+                    message_id="om_test_bot",
+                    sender_id="cli_test_app",
+                    sender_type="app",
+                    content="机器人自己的回复",
+                    create_time=now_ms(),
+                )
+            ),
+        ],
+    )
+    _poll(listener._Poller(idle_interval=60))
+    assert [m["text"] for m in inbox()] == ["看下日志", "富文本"]
+
+
+def test_item_to_event_maps_api_fields():
+    item = {
+        "chat_id": "oc_test_chat",
+        "message_id": "om_test_1",
+        "msg_type": "text",
+        "create_time": "1761465600000",
+        "message_position": "3",
+        "body": {"content": json.dumps({"text": "hi"})},
+        "sender": {"id": "ou_test_owner", "id_type": "open_id", "sender_type": "user"},
+    }
+    e = listener.item_to_event(item, "oc_test_chat")
+    assert e["sender_id"] == "ou_test_owner"
+    assert e["content"] == "hi" and e["message_type"] == "text"
+    assert e["create_time"] == "1761465600000" and e["mentions"] == []
+    item["sender"] = {"id": "cli_test_app", "id_type": "app_id", "sender_type": "app"}
+    assert listener.item_to_event(item, "oc_test_chat")["sender_id"] is None

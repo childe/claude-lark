@@ -74,6 +74,14 @@ def is_enabled(sid) -> bool:
     return alive
 
 
+def enabled_at_ms(sid):
+    """最近一次开启的时间（enabled 文件的 mtime，毫秒）；没开启返回 None。"""
+    try:
+        return int((paths.session_dir(sid) / "enabled").stat().st_mtime * 1000)
+    except OSError:
+        return None
+
+
 def set_enabled(sid, on: bool, claude_pid=None):
     """claude_pid 不为 None 时连同它的启动时间一起记下（取不到启动时间则
     is_enabled 会判定为未开启，调用方应检查）。"""

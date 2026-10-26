@@ -228,13 +228,35 @@ def test_doctor_reports_missing_install(monkeypatch, tmp_path, lark_home, capsys
     assert "❌" in out and "install.sh" in out
 
 
-def test_doctor_precondition_failure(monkeypatch, tmp_path, lark_home, capsys):
-    home, cli = _doctor(monkeypatch, tmp_path, lark_home, FAKE_LARK_PRECOND="missing")
+def test_doctor_accepts_needs_refresh(monkeypatch, tmp_path, lark_home, capsys):
+    from lark_bridge import doctor
+
+    lines = []
+    real = doctor._run
+
+    def run(args):
+        rc, out, err = real(args)
+        if args == ["auth", "status"]:
+            data = json.loads(out)
+            data["identities"]["user"]["status"] = "needs_refresh"
+            out = json.dumps(data)
+        return rc, out, err
+
+    _doctor(monkeypatch, tmp_path, lark_home)
+    monkeypatch.setattr(doctor, "_run", run)
+    doctor._check_auth(lambda ok, msg, fix=None: lines.append((ok, msg)))
+    assert lines and all(ok for ok, _ in lines)
+
+
+def test_doctor_reports_missing_read_scope(monkeypatch, tmp_path, lark_home, capsys):
+    home, cli = _doctor(
+        monkeypatch, tmp_path, lark_home, FAKE_LARK_USER_SCOPE="im:message"
+    )
     _install_fake(home)
     rc = cli.main(["doctor"])
     out = capsys.readouterr().out
     assert rc == 1
-    assert "console_event_published" in out
+    assert "im:message.group_msg:get_as_user" in out
 
 
 def test_doctor_owner_mismatch(monkeypatch, tmp_path, lark_home, capsys):

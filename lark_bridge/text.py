@@ -157,3 +157,55 @@ _PLACEHOLDER = re.compile(r"(?:@_user_\d+|@_all)(?!\w)[ \t]*")
 def strip_mentions(text: str) -> str:
     """Remove @_user_N / @_all placeholders only; user-written @path is kept."""
     return _PLACEHOLDER.sub("", text).strip()
+
+
+_POST_TEXT_TAGS = {"text", "a", "md", "code_block"}
+
+
+def _post_body(c: dict):
+    """post 内容可能是 {"title","content"}，也可能按语言包一层 {"zh_cn": {...}}。"""
+    if isinstance(c.get("content"), list):
+        return c
+    for v in c.values():
+        if isinstance(v, dict) and isinstance(v.get("content"), list):
+            return v
+    return None
+
+
+def render_content(msg_type, raw) -> str:
+    """消息接口返回的 body.content（JSON 字符串）→ 纯文本。
+
+    text 取 text 字段（@ 占位符 @_user_N 原样保留，交给 strip_mentions）；
+    post 拼接各段落里的文字，@ 元素丢弃；其他类型返回空串。"""
+    if not isinstance(raw, str):
+        return ""
+    try:
+        c = json.loads(raw)
+    except ValueError:
+        return ""
+    if not isinstance(c, dict):
+        return ""
+    if msg_type == "text":
+        t = c.get("text")
+        return t if isinstance(t, str) else ""
+    if msg_type != "post":
+        return ""
+    body = _post_body(c)
+    if body is None:
+        return ""
+    lines = []
+    title = body.get("title")
+    if isinstance(title, str) and title.strip():
+        lines.append(title)
+    for para in body["content"]:
+        if not isinstance(para, list):
+            continue
+        parts = [
+            el["text"]
+            for el in para
+            if isinstance(el, dict)
+            and el.get("tag") in _POST_TEXT_TAGS
+            and isinstance(el.get("text"), str)
+        ]
+        lines.append("".join(parts))
+    return "\n".join(lines).strip()

@@ -1,6 +1,7 @@
-"""全机唯一的飞书事件监听进程：按 chat_id 把群消息写进对应会话的收件箱。
+"""全机唯一的飞书消息监听进程：按 chat_id 把群消息写进对应会话的收件箱。
 
-飞书长连接对同一应用的多个连接是随机投递，所以整台机器只能有一个消费者。
+以 user 身份轮询已绑定的群（GET /open-apis/im/v1/messages），不用事件长连接：
+同一应用若已有别的后端连着长连接，飞书会把事件随机投给其中一个，本机收不全。
 """
 
 import contextlib
@@ -16,7 +17,7 @@ import traceback
 from pathlib import Path
 
 from . import feishu, paths, procs, state
-from .text import strip_mentions
+from .text import render_content, strip_mentions
 
 NOT_BRIDGED = "当前没有会话在桥接，回到电脑前在终端敲 /lark"
 OFF_REPLY = "已断开，终端里敲 /lark 可重新连接"
@@ -24,9 +25,12 @@ UNSUPPORTED = "暂不支持该类型消息，请发文字"
 HANDLE_FAILED = "处理失败，请重发"
 NOTICE_INTERVAL = 600  # 同一个群的"没有会话在桥接"提示最多 10 分钟一次
 SEND_TIMEOUT = 10
-EVENT_KEY = "im.message.receive_v1"
 _TEXT_TYPES = {"text", "post"}
-KILL_GRACE = 5  # terminate 之后这么多秒读循环还没结束就 kill
+POLL_INTERVAL = 2  # 开启中的群多久拉一次
+IDLE_POLL_INTERVAL = 60  # 已绑定但没开启的群多久拉一次（只为回"没有会话在桥接"）
+POLL_TIMEOUT = 15
+CLOCK_SLACK_MS = 5000  # 开启时间用本机时钟，消息时间是飞书服务端时钟
+_SEEN_MAX = 2000
 
 _notice_at = {}  # chat_id -> 上次发"没有会话"提示的时间
 _now = time.monotonic
@@ -245,25 +249,24 @@ def _any_enabled() -> bool:
     return alive
 
 
-def _stop_child(proc) -> None:
-    if proc is None or proc.poll() is not None:
-        return
-    try:
-        proc.terminate()
-    except OSError:
-        pass
+def item_to_event(item: dict, chat_id: str) -> dict:
+    """消息接口的 item → handle_event 认的事件格式。"""
+    sender = item.get("sender") if isinstance(item.get("sender"), dict) else {}
+    body = item.get("body") if isinstance(item.get("body"), dict) else {}
+    mtype = item.get("msg_type")
+    return {
+        "chat_id": item.get("chat_id") or chat_id,
+        "message_id": item.get("message_id"),
+        "message_type": mtype,
+        "sender_id": sender.get("id") if sender.get("id_type") == "open_id" else None,
+        "sender_type": sender.get("sender_type"),
+        "create_time": item.get("create_time"),
+        "mentions": item.get("mentions") or [],
+        "content": render_content(mtype, body.get("content")),
+    }
 
 
-def _process_line(line: str) -> None:
-    line = line.strip()
-    if not line:
-        return
-    try:
-        ev = json.loads(line)
-    except ValueError:
-        return
-    if not isinstance(ev, dict):
-        return
+def _process_event(ev: dict) -> None:
     _log(
         f"event {ev.get('message_id')} type={ev.get('message_type')}"
         f" chat={ev.get('chat_id')} sender_type={ev.get('sender_type')}"
@@ -276,35 +279,107 @@ def _process_line(line: str) -> None:
         )
 
 
-def main(check_interval: float = 30, restart_delay: float = 5) -> int:
+def _cursor_file() -> Path:
+    return paths.home() / "poll_cursors.json"
+
+
+def _load_cursors() -> dict:
+    try:
+        data = json.loads(_cursor_file().read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, int)}
+
+
+class _Poller:
+    """每个群记一个 message_position 游标（持久化，监听进程重启不重放）。
+
+    只处理游标之后、且 create_time 不早于"起点"的消息：开启中的群起点是开启时间，
+    所以关着时发的消息不会在重新开启后补发；没开启的群起点是本进程启动时间。"""
+
+    def __init__(self, idle_interval: float):
+        self.idle_interval = idle_interval
+        self.cursors = _load_cursors()
+        self.started_ms = int(time.time() * 1000)
+        self.idle_at = {}  # chat_id -> 上次拉取（monotonic）
+        self.failing = set()
+        self.seen = []  # 最近处理过的 message_id（兜底：拿不到 position 的消息）
+
+    def targets(self) -> dict:
+        out = {}
+        idle = set()
+        for b in state.all_bindings():
+            if not b.chat_id:
+                continue
+            if state.is_enabled(b.session_id):
+                t = state.enabled_at_ms(b.session_id)
+                since = (t - CLOCK_SLACK_MS) if t else self.started_ms
+                out[b.chat_id] = min(since, out.get(b.chat_id, since))
+            else:
+                idle.add(b.chat_id)
+        now = _now()
+        for chat in idle - set(out):
+            last = self.idle_at.get(chat)
+            if last is None or now - last >= self.idle_interval:
+                self.idle_at[chat] = now
+                out[chat] = self.started_ms - CLOCK_SLACK_MS
+        return out
+
+    def poll_once(self, stop) -> None:
+        for chat, since in self.targets().items():
+            if stop.is_set():
+                return
+            try:
+                self.poll_chat(chat, since, stop)
+            except Exception as e:
+                if chat not in self.failing:
+                    self.failing.add(chat)
+                    _log(f"poll {chat} failed: {e}")
+                continue
+            if chat in self.failing:
+                self.failing.discard(chat)
+                _log(f"poll {chat} recovered")
+
+    def poll_chat(self, chat: str, since: int, stop) -> None:
+        cur = self.cursors.get(chat)
+        items = feishu.list_messages(chat, after_position=cur, timeout=POLL_TIMEOUT)
+        changed = False
+        for it in items:
+            if stop.is_set():
+                break
+            pos = feishu.position(it)
+            if cur is not None and 0 <= pos <= cur:
+                continue
+            mid = it.get("message_id")
+            if mid in self.seen:
+                continue
+            ct = feishu.to_ms(it.get("create_time"))
+            if not it.get("deleted") and (ct is None or ct >= since):
+                _process_event(item_to_event(it, chat))
+            if isinstance(mid, str):
+                self.seen.append(mid)
+                del self.seen[:-_SEEN_MAX]
+            if pos > self.cursors.get(chat, -1):
+                self.cursors[chat] = pos
+                changed = True
+        if changed:
+            state._atomic_write(_cursor_file(), json.dumps(self.cursors))
+
+
+def main(
+    check_interval: float = 30,
+    poll_interval: float = POLL_INTERVAL,
+    idle_interval: float = IDLE_POLL_INTERVAL,
+) -> int:
     if not _acquire_pid_file():
         return 0
     stop = threading.Event()
-    cur = {"proc": None}
-    lock = threading.RLock()  # SIGTERM 处理函数可能在主线程持锁时运行
-
-    def request_stop():
-        stop.set()
-        with lock:
-            proc = cur["proc"]
-            _stop_child(proc)
-        if proc is not None:
-            # 读循环 KILL_GRACE 秒后还没结束（子进程不理 SIGTERM）就升级为 kill
-            def escalate():
-                if proc.poll() is None:
-                    _log(f"lark-cli pid={proc.pid} ignored SIGTERM, killing")
-                    try:
-                        proc.kill()
-                    except OSError:
-                        pass
-
-            t = threading.Timer(KILL_GRACE, escalate)
-            t.daemon = True
-            t.start()
 
     def on_sigterm(signum, frame):
         _log("SIGTERM received")
-        request_stop()
+        stop.set()
 
     old_handler = None
     try:
@@ -317,7 +392,7 @@ def main(check_interval: float = 30, restart_delay: float = 5) -> int:
             try:
                 if not _any_enabled() and _try_exit():
                     _log("no enabled sessions, exiting")
-                    request_stop()
+                    stop.set()
             except Exception:
                 _log(f"watchdog failed: {traceback.format_exc()}")
 
@@ -325,66 +400,18 @@ def main(check_interval: float = 30, restart_delay: float = 5) -> int:
         if not _any_enabled() and _try_exit():
             _log("no enabled sessions at start, exiting")
             return 0
-        _log("listener started")
+        _log("listener started (polling as user)")
         threading.Thread(target=watchdog, daemon=True).start()
+        poller = _Poller(idle_interval)
         while not stop.is_set():
-            proc = None
             try:
-                with lock:
-                    if stop.is_set():
-                        break
-                    with open(paths.listener_log(), "a") as errlog:
-                        proc = subprocess.Popen(
-                            [
-                                paths.lark_cli(),
-                                "event",
-                                "consume",
-                                EVENT_KEY,
-                                "--as",
-                                "bot",
-                            ],
-                            # lark-cli 把 stdin EOF 当作退出信号：给一根不写也不关的管道
-                            stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE,
-                            stderr=errlog,
-                            text=True,
-                            encoding="utf-8",
-                            errors="replace",
-                        )
-                    cur["proc"] = proc
-                    if stop.is_set():  # SIGTERM 落在 Popen 与上一行之间
-                        _stop_child(proc)
-                _log(f"started lark-cli pid={proc.pid}")
-                for line in proc.stdout:
-                    _process_line(line)
-                rc = proc.wait()
+                poller.poll_once(stop)
             except Exception:
-                _log(f"lark-cli loop failed: {traceback.format_exc()}")
-                rc = None
-            finally:
-                if proc is not None:
-                    _stop_child(proc)
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait()
-                    if proc.stdout:
-                        proc.stdout.close()
-                    if proc.stdin:
-                        proc.stdin.close()
-            if stop.is_set():
-                break
-            _log(f"lark-cli exited rc={rc}, restarting in {restart_delay}s")
-            stop.wait(restart_delay)
+                _log(f"poll loop failed: {traceback.format_exc()}")
+            stop.wait(poll_interval)
         return 0
     finally:
         stop.set()
-        with lock:
-            p = cur["proc"]
-        if p is not None and p.poll() is None:
-            p.kill()
-            p.wait()
         _release_pid_file()
         _log("listener exited")
         if old_handler is not None:

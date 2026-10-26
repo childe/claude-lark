@@ -1,3 +1,4 @@
+import json
 from lark_bridge import text
 from lark_bridge.text import (
     DELIVER_PREFIX,
@@ -181,3 +182,25 @@ def test_split_message_with_longer_fence_and_inner_backticks():
     joined = "\n".join(parts)
     assert joined.count("z" * 40) == inner.count("z" * 40)
     assert parts[-1].endswith("回复「同意」或「拒绝」（1 / 2）")
+
+
+def test_render_content_text_and_post():
+    from lark_bridge.text import render_content
+
+    assert render_content("text", json.dumps({"text": "@_user_1 hi"})) == "@_user_1 hi"
+    post = {
+        "title": "",
+        "content": [
+            [
+                {"tag": "at", "user_id": "@_user_1", "user_name": "bot"},
+                {"tag": "text", "text": "看 "},
+                {"tag": "a", "text": "链接", "href": "https://example.com"},
+            ],
+            [{"tag": "img", "image_key": "img_x"}, {"tag": "text", "text": "第二行"}],
+        ],
+    }
+    assert render_content("post", json.dumps(post)) == "看 链接\n第二行"
+    assert render_content("post", json.dumps({"zh_cn": post})) == "看 链接\n第二行"
+    assert render_content("image", json.dumps({"image_key": "x"})) == ""
+    assert render_content("text", "not json") == ""
+    assert render_content("text", None) == ""

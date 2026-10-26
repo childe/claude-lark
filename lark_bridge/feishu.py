@@ -1,6 +1,8 @@
 """lark-cli 子进程封装。发消息一律 --as bot。"""
 
 import json
+import os
+import signal
 import subprocess
 import time
 import traceback
@@ -31,21 +33,43 @@ def log_exception(where: str) -> None:
     log_error(f"{where}: {traceback.format_exc()}")
 
 
+def _kill_group(p) -> None:
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
 def _run(args, timeout=TIMEOUT) -> str:
-    """运行 lark-cli，返回 stdout；非 0 退出、超时、找不到可执行文件都抛 FeishuError。"""
+    """运行 lark-cli，返回 stdout；非 0 退出、超时、找不到可执行文件都抛 FeishuError。
+
+    lark-cli 是 node 包装脚本再拉起真正的二进制：放进独立进程组，超时时整组杀掉，
+    否则孙进程攥着输出管道，读取会一直等下去。"""
     cmd = [paths.lark_cli(), *args]
     try:
-        r = subprocess.run(
+        p = subprocess.Popen(
             cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
             stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired:
-        raise FeishuError(f"lark-cli {args[:2]} timed out after {timeout}s")
     except OSError as e:
         raise FeishuError(f"lark-cli {args[:2]} failed to start: {e}")
+    try:
+        stdout, stderr = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(p)
+        p.communicate()
+        raise FeishuError(f"lark-cli {args[:2]} timed out after {timeout}s")
+    except BaseException:
+        _kill_group(p)
+        p.communicate()
+        raise
+    r = subprocess.CompletedProcess(cmd, p.returncode, stdout, stderr)
     if r.returncode != 0:
         raise FeishuError(
             f"lark-cli {args[:2]} exit {r.returncode}: {(r.stderr or r.stdout).strip()}"
@@ -164,3 +188,60 @@ def bot_in_chat(chat_id: str) -> bool:
         log_error(f"bot_in_chat {chat_id}: {e}")
         return False
     return True
+
+
+def list_messages(
+    chat_id: str,
+    after_position=None,
+    page_size: int = 50,
+    max_pages: int = 5,
+    timeout: float = 15,
+):
+    """以 user 身份拉群消息，按 message_position 从旧到新返回原始 item 列表。
+
+    after_position 为 None 时只拉最新一页；否则一直往前翻页，直到翻过
+    after_position 或达到 max_pages。失败抛 FeishuError。"""
+    items = []
+    token = None
+    for _ in range(max_pages):
+        params = {
+            "container_id_type": "chat",
+            "container_id": chat_id,
+            "sort_type": "ByCreateTimeDesc",
+            "page_size": page_size,
+        }
+        if token:
+            params["page_token"] = token
+        data = _json(
+            _run(
+                [
+                    "api",
+                    "GET",
+                    "/open-apis/im/v1/messages",
+                    "--as",
+                    "user",
+                    "--params",
+                    json.dumps(params),
+                ],
+                timeout=timeout,
+            )
+        )
+        if data.get("ok") is False:
+            raise FeishuError(f"list messages failed: {json.dumps(data)[:200]}")
+        page = data.get("data") or {}
+        batch = [x for x in page.get("items") or [] if isinstance(x, dict)]
+        items.extend(batch)
+        token = page.get("page_token")
+        if after_position is None or not page.get("has_more") or not token:
+            break
+        if any(position(x) <= after_position for x in batch):
+            break
+    items.sort(key=position)
+    return items
+
+
+def position(item: dict) -> int:
+    try:
+        return int(item.get("message_position"))
+    except (TypeError, ValueError):
+        return -1

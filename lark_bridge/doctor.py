@@ -73,6 +73,11 @@ def _check_cli(report):
     return True
 
 
+READ_SCOPE = "im:message.group_msg:get_as_user"
+# needs_refresh：access token 过期但 refresh token 还有效，下一次调用会自动刷新
+_OK_STATUS = {"ready", "needs_refresh"}
+
+
 def _check_auth(report):
     """返回当前 auth status 里的 user open_id（取不到为 None）。"""
     rc, out, err = _run(["auth", "status"])
@@ -84,7 +89,9 @@ def _check_auth(report):
         )
         return None
     ids = _json(out).get("identities") or {}
-    bad = [n for n in ("bot", "user") if (ids.get(n) or {}).get("status") != "ready"]
+    bad = [
+        n for n in ("bot", "user") if (ids.get(n) or {}).get("status") not in _OK_STATUS
+    ]
     if bad:
         report(
             False,
@@ -93,38 +100,19 @@ def _check_auth(report):
         )
     else:
         report(True, "bot 与 user 身份均 ready")
-    oid = (ids.get("user") or {}).get("openId")
+    user = ids.get("user") or {}
+    if "user" not in bad:
+        scopes = str(user.get("scope") or "").split()
+        if READ_SCOPE in scopes:
+            report(True, f"user 身份有读群消息权限（{READ_SCOPE}）")
+        else:
+            report(
+                False,
+                f"user 身份缺少读群消息权限 {READ_SCOPE}",
+                f"lark-cli auth login --scope {READ_SCOPE}",
+            )
+    oid = user.get("openId")
     return oid if isinstance(oid, str) and oid else None
-
-
-def _check_events(report):
-    rc, out, err = _run(
-        ["event", "consume", "im.message.receive_v1", "--as", "bot", "--dry-run"]
-    )
-    if rc != 0:
-        report(
-            False,
-            f"事件订阅 dry-run 失败：{(err or out).strip()[:100]}",
-            "lark-cli event consume im.message.receive_v1 --as bot --dry-run",
-        )
-        return
-    pre = ((_json(out).get("data") or {}).get("decision") or {}).get("preconditions")
-    if not isinstance(pre, list) or not pre:
-        report(
-            False,
-            "dry-run 没返回 preconditions",
-            "lark-cli event consume im.message.receive_v1 --as bot --dry-run",
-        )
-        return
-    bad = [p.get("name", "?") for p in pre if (p or {}).get("status") != "ok"]
-    if bad:
-        report(
-            False,
-            f"事件订阅前置条件未通过：{', '.join(bad)}",
-            "到飞书开放平台检查：发布应用、订阅 im.message.receive_v1（长连接）、开通所需权限",
-        )
-    else:
-        report(True, "事件订阅 im.message.receive_v1 前置条件全部通过")
 
 
 def _check_files(report):
@@ -188,7 +176,6 @@ def run() -> int:
     _check_python(report)
     if _check_cli(report):
         oid = _check_auth(report)
-        _check_events(report)
     else:
         oid = None
     _check_files(report)
