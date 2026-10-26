@@ -75,12 +75,15 @@ class Peeked(list):
     offset: int = 0
 
 
-def wait_for_messages(sid, deadline: float, now, sleep, since: int = 0):
-    """每 POLL_SECONDS 秒 peek 一次（只看收件箱里 since 偏移之后到达的消息）。
+def wait_for_messages(sid, deadline: float, now, sleep, since: int = 0, accept=None):
+    """每 POLL_SECONDS 秒 peek 一次（只看收件箱里 since 偏移之后到达的消息，
+    且 accept(m) 为真的；accept 为 None 时不过滤）。
     有消息 → 返回 Peeked（不 commit）；到 deadline 或桥接被关闭 → 返回 None。
     SIGTERM 时 HookTerminated 向上抛出。"""
     while True:
         msgs, offset = state.peek_inbox(sid, since)
+        if accept is not None:
+            msgs = [m for m in msgs if accept(m)]
         if msgs:
             out = Peeked(msgs)
             out.offset = offset
@@ -101,6 +104,22 @@ def _sort_key(m):
 def _create_order(msgs):
     """按 create_time 排序的下标（稳定）。"""
     return sorted(range(len(msgs)), key=lambda i: _sort_key(msgs[i]))
+
+
+def _created_after(sent_at):
+    """只认 create_time 不早于提示消息的回复（都是飞书服务端时间，没有时钟偏差）。
+
+    防的是上一次提示的重复回复晚到、排在收件箱边界之后的情况。
+    提示的 create_time 拿不到时返回 None，只按收件箱位置判断；
+    回复自己的 create_time 不可用时也不拦。"""
+    if sent_at is None:
+        return None
+
+    def accept(m) -> bool:
+        t = feishu.to_ms(m.get("create_time"))
+        return t is None or t >= sent_at
+
+    return accept
 
 
 def _text(m) -> str:
@@ -198,10 +217,13 @@ def _permission(sid, data, binding, deadline, now, sleep) -> str:
         raise ValueError(f"permission: tool_input is {type(tool_input).__name__}")
     # 只有提示发出之后才到达的消息算回复；之前积压的留给 Stop hook
     since = state.inbox_size(sid)
-    feishu.send(chat, format_permission(str(data.get("tool_name")), tool_input))
+    _, sent_at = feishu.send_with_time(
+        chat, format_permission(str(data.get("tool_name")), tool_input)
+    )
+    accept = _created_after(sent_at)
     try:
         while True:
-            msgs = wait_for_messages(sid, deadline, now, sleep, since)
+            msgs = wait_for_messages(sid, deadline, now, sleep, since, accept)
             if msgs is None:
                 if state.is_enabled(sid):
                     feishu.send(chat, MSG_PERM_TIMEOUT)
@@ -253,9 +275,11 @@ def _ask(sid, data, binding, deadline, now, sleep) -> str:
     ):
         raise ValueError("ask: malformed tool_input.questions")
     since = state.inbox_size(sid)
-    feishu.send(chat, format_questions(questions))
+    _, sent_at = feishu.send_with_time(chat, format_questions(questions))
     try:
-        msgs = wait_for_messages(sid, deadline, now, sleep, since)
+        msgs = wait_for_messages(
+            sid, deadline, now, sleep, since, _created_after(sent_at)
+        )
         if msgs is None:
             if state.is_enabled(sid):
                 feishu.send(chat, MSG_ASK_HANDBACK)

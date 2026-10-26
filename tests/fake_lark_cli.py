@@ -5,6 +5,8 @@
 - $FAKE_LARK_SLEEP=N 时先睡 N 秒（测超时用）。
 - $FAKE_LARK_FAIL=1 时打印错误并以 1 退出。
 - im +chat-create → {"data":{"chat_id":"oc_test_chat"}}
+- im +messages-send → {"data":{"message_id","chat_id","create_time"}}；create_time 默认是当前
+  毫秒时间，$FAKE_LARK_SEND_TIME 可固定它，设为 none 时不返回该字段
 - im +chat-members-list → {"data":{"bots":[],"users":[]}}；$FAKE_LARK_NOT_IN_CHAT=1 时报错退出 1
 - auth status → owner ou_test_owner
 - --version → lark-cli version 1.0.92（$FAKE_LARK_PRECOND 可改 dry-run 里一项的 status）
@@ -77,7 +79,11 @@ def main(argv):
     elif argv[:2] == ["im", "+chat-create"]:
         print(json.dumps({"ok": True, "data": {"chat_id": "oc_test_chat"}}))
     elif argv[:2] == ["im", "+messages-send"]:
-        print(json.dumps({"ok": True, "data": {"message_id": "om_test_sent"}}))
+        data = {"message_id": "om_test_sent", "chat_id": "oc_test_chat"}
+        ct = os.environ.get("FAKE_LARK_SEND_TIME") or str(int(time.time() * 1000))
+        if ct != "none":
+            data["create_time"] = ct
+        print(json.dumps({"ok": True, "data": data}))
     elif argv[:2] == ["im", "+chat-members-list"]:
         if os.environ.get("FAKE_LARK_NOT_IN_CHAT") == "1":
             print("fake lark-cli: bot not in chat", file=sys.stderr)

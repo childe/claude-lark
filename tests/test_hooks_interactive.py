@@ -688,3 +688,53 @@ def test_permission_ambiguous_hint_says_message_was_ignored(bridged):
     out = hooks.run("permission", perm_input(), clock.now, clock.sleep)
     assert json.loads(out) == ALLOW
     assert HINT_IGNORED in sent_texts(bridged())
+
+
+def test_send_with_time_returns_prompt_create_time(fake, monkeypatch):
+    monkeypatch.setenv("FAKE_LARK_SEND_TIME", "1761465600123")
+    assert feishu.send_with_time("oc_test_chat", "hi") == (True, 1761465600123)
+    assert feishu.send("oc_test_chat", "hi") is True
+    monkeypatch.setenv("FAKE_LARK_SEND_TIME", "none")
+    assert feishu.send_with_time("oc_test_chat", "hi") == (True, None)
+    monkeypatch.setenv("FAKE_LARK_FAIL", "1")
+    assert feishu.send_with_time("oc_test_chat", "hi") == (False, None)
+    assert feishu.send("oc_test_chat", "hi") is False
+
+
+def test_permission_ignores_late_reply_created_before_prompt(bridged, monkeypatch):
+    """上一个权限请求的重复"同意"晚到（排在边界之后），但它的 create_time
+    早于这条提示：不能批准这一个。它留给 Stop hook，不丢。"""
+    monkeypatch.setenv("FAKE_LARK_SEND_TIME", "1761465600500")
+    clock = Clock(
+        arrive(
+            (1, msg(1, "同意", "1761465600400")),
+            (3, msg(2, "拒绝", "1761465600600")),
+        )
+    )
+    out = hooks.run("permission", perm_input(), clock.now, clock.sleep)
+    assert json.loads(out) == DENY
+    assert clock.sleeps >= 3
+    assert hooks.MSG_PERM_HINT not in sent_texts(bridged())
+    assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["同意"]
+
+
+def test_permission_without_prompt_time_falls_back_to_position(bridged, monkeypatch):
+    monkeypatch.setenv("FAKE_LARK_SEND_TIME", "none")
+    clock = Clock(arrive((1, msg(1, "同意", "1761465600400"))))
+    out = hooks.run("permission", perm_input(), clock.now, clock.sleep)
+    assert json.loads(out) == ALLOW
+
+
+def test_ask_ignores_late_reply_created_before_prompt(bridged, monkeypatch):
+    monkeypatch.setenv("FAKE_LARK_SEND_TIME", "1761465600500")
+    clock = Clock(
+        arrive(
+            (1, msg(1, "1", "1761465600400")),
+            (3, msg(2, "2", "1761465600600")),
+        )
+    )
+    out = json.loads(hooks.run("ask", ask_input(), clock.now, clock.sleep))
+    assert out["hookSpecificOutput"]["updatedInput"]["answers"] == {
+        "Which color?": "Blue"
+    }
+    assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["1"]

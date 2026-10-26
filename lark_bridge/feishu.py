@@ -53,13 +53,42 @@ def _run(args, timeout=TIMEOUT) -> str:
     return r.stdout
 
 
-def send(chat_id: str, markdown: str, timeout: float = TIMEOUT) -> bool:
-    """分段发送；任何失败只记 errors.log，不抛出。某段失败后不再发后续段。
+def to_ms(v):
+    """飞书 create_time → 毫秒整数；取不到返回 None。
 
-    timeout 是每一段的 lark-cli 超时秒数。全部发出返回 True，否则 False。"""
+    事件里是毫秒字符串；万一某处给的是秒（< 1e11），按秒换算，保证两边可比。"""
     try:
-        for part in split_message(markdown):
-            _run(
+        n = int(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    return n * 1000 if n < 10**11 else n
+
+
+def _sent_create_time(out: str):
+    """+messages-send 输出里的 create_time（顶层或 data 下），取不到返回 None。"""
+    try:
+        data = json.loads(out)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    inner = data.get("data")
+    ct = data.get("create_time")
+    if ct is None and isinstance(inner, dict):
+        ct = inner.get("create_time")
+    return to_ms(ct)
+
+
+def send_with_time(chat_id: str, markdown: str, timeout: float = TIMEOUT):
+    """同 send，另外返回第一段消息在飞书服务端的 create_time（毫秒，取不到为 None）。
+
+    返回 (是否全部发出, create_time)。"""
+    first = None
+    try:
+        for i, part in enumerate(split_message(markdown)):
+            out = _run(
                 [
                     "im",
                     "+messages-send",
@@ -72,12 +101,21 @@ def send(chat_id: str, markdown: str, timeout: float = TIMEOUT) -> bool:
                 ],
                 timeout=timeout,
             )
-        return True
+            if i == 0:
+                first = _sent_create_time(out)
+        return True, first
     except FeishuError as e:
         log_error(f"send to {chat_id}: {e}")
     except Exception:
         log_exception(f"send to {chat_id}")
-    return False
+    return False, first
+
+
+def send(chat_id: str, markdown: str, timeout: float = TIMEOUT) -> bool:
+    """分段发送；任何失败只记 errors.log，不抛出。某段失败后不再发后续段。
+
+    timeout 是每一段的 lark-cli 超时秒数。全部发出返回 True，否则 False。"""
+    return send_with_time(chat_id, markdown, timeout)[0]
 
 
 def _json(out: str) -> dict:

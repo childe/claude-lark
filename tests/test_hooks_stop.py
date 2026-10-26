@@ -22,6 +22,8 @@ def fake(lark_home, tmp_path, monkeypatch):
     monkeypatch.delenv("FAKE_LARK_FAIL", raising=False)
     monkeypatch.delenv("FAKE_LARK_SLEEP", raising=False)
     monkeypatch.delenv("CLAUDE_LARK_WAIT_SECONDS", raising=False)
+    # 测试消息的 create_time 用很小的假值；让"提示消息"的 create_time 不晚于它们
+    monkeypatch.setenv("FAKE_LARK_SEND_TIME", "1")
 
     def calls():
         if not log.exists():
