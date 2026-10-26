@@ -1,0 +1,11 @@
+[project]
+name = "claude-lark"
+version = "0.1.0"
+requires-python = ">=3.9"
+
+[tool.black]
+line-length = 88
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
