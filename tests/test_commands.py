@@ -71,11 +71,26 @@ def test_slash_creates_group_with_given_name(fake):
     assert msgs == [f"已连接：{os.getcwd()}，会话 {SID[:8]}"]
 
 
-def test_owner_falls_back_to_auth_status(fake, lark_home):
-    (lark_home / "config.json").write_text("{}")
-    commands.slash(SID, "x")
-    create = [c for c in fake() if c[:2] == ["im", "+chat-create"]][0]
-    assert arg(create, "--users") == "ou_test_owner"
+NO_OWNER = "RESULT: 未找到 owner 配置，请重新运行 install.sh"
+
+
+@pytest.mark.parametrize("cfg", ["{}", "not json", '{"owner_open_id": ""}', None])
+def test_slash_refuses_without_owner_config(fake, lark_home, cfg):
+    """没有 owner 时监听进程会丢弃所有消息：不能悄悄退回 auth status 去开桥接。"""
+    if cfg is None:
+        (lark_home / "config.json").unlink()
+    else:
+        (lark_home / "config.json").write_text(cfg)
+    assert commands.slash(SID, "x") == NO_OWNER
+    assert commands.slash(SID2, "oc_test_other") == NO_OWNER
+    assert commands.on(SID, "x") == NO_OWNER
+    bind(SID, name="旧群")
+    assert commands.slash(SID, "") == NO_OWNER
+    assert not state.is_enabled(SID) and not state.is_enabled(SID2)
+    assert fake() == [] and fake.started == []
+    # off / status 不需要 owner
+    assert "未绑定" not in commands.slash(SID, "status")
+    assert commands.slash(SID, "off").startswith("RESULT: 已关闭桥接")
 
 
 def test_slash_existing_binding_ignores_name(fake):
@@ -204,8 +219,7 @@ def test_slash_never_raises(fake, monkeypatch, lark_home):
 def test_missing_owner_gives_result(fake, lark_home, monkeypatch):
     (lark_home / "config.json").write_text("{}")
     monkeypatch.setenv("FAKE_LARK_FAIL", "1")
-    out = commands.slash(SID, "x")
-    assert out.startswith("RESULT: 出错了：") and "doctor" in out
+    assert commands.slash(SID, "x") == NO_OWNER
 
 
 def test_cli_slash_and_on(fake, lark_home):

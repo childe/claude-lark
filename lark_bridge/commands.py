@@ -37,19 +37,19 @@ def on(sid: str, name: str) -> str:
     return _safe("commands.on", _on, sid, name)
 
 
-def _owner() -> str:
+NO_OWNER = "未找到 owner 配置，请重新运行 install.sh"
+
+
+def _owner():
+    """config.json 里的 owner_open_id；没有返回 None。
+
+    不退回 auth status：监听进程只认 config.json，没有 owner 时它会丢弃所有消息，
+    桥接开了也收不到东西。"""
     try:
         oid = json.loads(paths.config_file().read_text()).get("owner_open_id")
     except (OSError, ValueError, AttributeError):
         oid = None
-    if isinstance(oid, str) and oid:
-        return oid
-    try:
-        return feishu.owner_open_id()
-    except feishu.FeishuError:
-        raise RuntimeError(
-            "找不到绑定者的 open_id，请运行安装脚本或 claude-lark doctor"
-        )
+    return oid if isinstance(oid, str) and oid else None
 
 
 def _is_chat_ref(args: str) -> bool:
@@ -66,6 +66,9 @@ def _slash(sid: str, args: str) -> str:
         return _off(sid)
     if args == "status":
         return _status(sid)
+    owner = _owner()
+    if owner is None:
+        return _result(NO_OWNER)
     b = state.load_binding(sid)
     if _is_chat_ref(args):
         if b:
@@ -79,17 +82,20 @@ def _slash(sid: str, args: str) -> str:
         return _enable(sid, b, ignored=args)
     if not args:
         return NEED_NAME
-    return _create_and_enable(sid, args)
+    return _create_and_enable(sid, args, owner)
 
 
 def _on(sid: str, name: str) -> str:
     name = (name or "").strip()
+    owner = _owner()
+    if owner is None:
+        return _result(NO_OWNER)
     b = state.load_binding(sid)
     if b:
         return _enable(sid, b, ignored=name)
     if not name:
         return _result("群名不能为空")
-    return _create_and_enable(sid, name)
+    return _create_and_enable(sid, name, owner)
 
 
 def _off(sid: str) -> str:
@@ -126,8 +132,7 @@ def _claude_pid():
     return pid
 
 
-def _create_and_enable(sid: str, name: str) -> str:
-    owner = _owner()
+def _create_and_enable(sid: str, name: str, owner: str) -> str:
     pid = _claude_pid()
     if pid is None:
         return _result(NO_CLAUDE)
@@ -139,7 +144,6 @@ def _create_and_enable(sid: str, name: str) -> str:
 
 
 def _bind_existing(sid: str, chat_id: str) -> str:
-    _owner()
     pid = _claude_pid()
     if pid is None:
         return _result(NO_CLAUDE)
