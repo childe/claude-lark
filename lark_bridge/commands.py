@@ -8,7 +8,7 @@ import time
 from . import feishu, listener, paths, procs, state
 
 NEED_NAME = "NEED_NAME"
-HINT = "离开前就绪；回到电脑前按 Esc 拿回终端，/lark off 停止同步"
+HINT = "在群里发消息就能继续这个会话，终端也照常可用；/lark off 停止同步"
 MAX_NAME = 60
 NO_CLAUDE = (
     "未能识别 claude 进程，无法开启桥接（会话退出后无法自动断开）。"

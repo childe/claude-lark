@@ -12,19 +12,24 @@ HOOK_MARK = "claude-lark"
 _PATH_MARK = "/.claude/lark/app/bin/claude-lark"
 _BIN = "$HOME/.claude/lark/app/bin/claude-lark"
 
+# 旧版本（同步阻塞的 Stop hook）写进 env 的条目；merge / remove 时清掉
 ENV_KEY = "CLAUDE_CODE_STOP_HOOK_BLOCK_CAP"
 ENV_VALUE = "1000"
 
-# (事件, matcher 或 None, hook 子命令, timeout)
+# Stop hook 在后台等飞书消息，不占终端；exit 2 时唤醒模型（Claude Code 2.1.287 实测）
+_ASYNC = {"asyncRewake": True}
+
+# (事件, matcher 或 None, hook 子命令, timeout, 额外字段)
 _ENTRIES = [
-    ("Stop", None, "stop", 3600),
-    ("PermissionRequest", "*", "permission", 3600),
-    # matcher 必须精确，更宽的 matcher 会自动放行任意工具
-    ("PreToolUse", "AskUserQuestion", "ask", 3600),
-    ("UserPromptSubmit", None, "prompt", 30),
+    ("Stop", None, "stop", 86400, _ASYNC),
+    # AskUserQuestion 也走这里：选项框和飞书同时作答，谁先答算谁的
+    ("PermissionRequest", "*", "permission", 3600, {}),
+    ("UserPromptSubmit", None, "prompt", 30, {}),
+    # 每个回合开始时补一个后台等待进程（已有就立刻退出），见 hooks._wait
+    ("UserPromptSubmit", None, "wait", 86400, _ASYNC),
     # /clear、/resume、退出时断开桥接；不阻塞，超时给短一点
-    ("SessionStart", None, "session-start", 10),
-    ("SessionEnd", None, "session-end", 10),
+    ("SessionStart", None, "session-start", 10, {}),
+    ("SessionEnd", None, "session-end", 10, {}),
 ]
 
 
@@ -98,7 +103,7 @@ def merge(cfg: dict) -> dict:
     out = copy.deepcopy(cfg)
     _strip(out)
     hooks = out.setdefault("hooks", {})
-    for event, matcher, sub, timeout in _ENTRIES:
+    for event, matcher, sub, timeout, extra in _ENTRIES:
         group = {}
         if matcher is not None:
             group["matcher"] = matcher
@@ -107,38 +112,47 @@ def merge(cfg: dict) -> dict:
                 "type": "command",
                 "command": f"{_BIN} hook {sub}",
                 "timeout": timeout,
+                **extra,
             }
         ]
         hooks.setdefault(event, []).append(group)
-    env = out.setdefault("env", {})
-    env[ENV_KEY] = ENV_VALUE
+    _strip_env(out)
     return out
+
+
+def _strip_env(cfg: dict) -> None:
+    """删掉旧版本写入的 env 条目（只删值和我们写的一样的）。"""
+    env = cfg.get("env")
+    if isinstance(env, dict) and env.get(ENV_KEY) == ENV_VALUE:
+        del env[ENV_KEY]
+        if not env:
+            del cfg["env"]
 
 
 def remove(cfg: dict) -> dict:
     _validate(cfg)
     out = copy.deepcopy(cfg)
     _strip(out)
-    env = out.get("env")
-    if isinstance(env, dict) and ENV_KEY in env:
-        del env[ENV_KEY]
-        if not env:
-            del out["env"]
+    _strip_env(out)
     return out
 
 
 def has_hooks(cfg: dict) -> bool:
-    """所有事件是否都已注册本项目的 hook。"""
+    """所有事件是否都已注册本项目的 hook（含 asyncRewake 等字段，旧版本的配置算没有）。"""
     hooks = cfg.get("hooks") if isinstance(cfg, dict) else None
     if not isinstance(hooks, dict):
         return False
-    for event, matcher, sub, _t in _ENTRIES:
+    for event, matcher, sub, _t, extra in _ENTRIES:
         found = False
         for g in hooks.get(event) or []:
             if not isinstance(g, dict) or g.get("matcher") != matcher:
                 continue
             for h in g.get("hooks") or []:
-                if _is_ours(h) and str(h.get("command", "")).endswith(f"hook {sub}"):
+                if (
+                    _is_ours(h)
+                    and str(h.get("command", "")).endswith(f"hook {sub}")
+                    and all(h.get(k) == v for k, v in extra.items())
+                ):
                     found = True
         if not found:
             return False

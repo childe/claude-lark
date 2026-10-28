@@ -5,16 +5,20 @@
 # 用法：tests/e2e/run_e2e.sh [基目录]
 #   基目录默认是仓库里（已 gitignore）的 .superpowers/e2e；每次运行在下面新建 e2e-<时间戳>-XXXX。
 #   E2E_ONLY="2 3" 只跑这些场景（场景 1 总会先跑，其余场景都依赖它的绑定）。
-#   E2E_MODEL 覆盖模型（默认 haiku）。临时目录不会删除，方便排查。
+#   E2E_MODEL 覆盖模型（默认 sonnet；haiku 不执行从飞书唤醒进来的 prompt）。临时目录不会删除，方便排查。
 #
 # 不碰真实的 ~/.claude/settings.json、~/.claude/commands：hooks 和 /lark 都写在临时 project 的 .claude/ 里。
+# claude 以 --setting-sources project,local 启动，用户级 settings 里的 hooks（包括已安装的 claude-lark）不加载。
 set -u
 
 REPO="$(builtin cd "$(dirname "$0")/../.." && pwd)"
 BIN="$REPO/bin/claude-lark"
 FAKE="$REPO/tests/fake_lark_cli.py"
-MODEL="${E2E_MODEL:-claude-haiku-4-5-20251001}"
+MODEL="${E2E_MODEL:-claude-sonnet-5-5}"
+# 权限 / 提问 hook 等飞书回复的时长
 WAIT_SECONDS=20
+# 后台等待进程空闲多久后用保活唤醒一次
+IDLE_SECONDS=30
 TIMEOUT=90
 
 BASE="${1:-$REPO/.superpowers/e2e}"
@@ -197,16 +201,19 @@ wait_for() {
 }
 
 pane_has() { pane | grep -qF -- "$1"; }
-# 本次 pane 的后代里有没有 Stop hook 进程（hook 由 claude 经 sh -c 启动）
-stop_hook_waiting() {
-    local p
+# 本次 pane 的后代里后台等待进程（Stop / UserPromptSubmit 上的 asyncRewake hook）的数量
+stop_hook_count() {
+    local p n=0
     for p in $(descendants "$PANE_PID"); do
+        # 只数 claude-lark 本身，不数外面那层 sh -c
         case "$(ps -o args= -p "$p" 2>/dev/null)" in
-        *"$BIN hook stop"*) return 0 ;;
+        *" -c "*) ;;
+        *"$BIN hook stop"* | *"$BIN hook wait"*) n=$((n + 1)) ;;
         esac
     done
-    return 1
+    echo "$n"
 }
+stop_hook_waiting() { [ "$(stop_hook_count)" -ge 1 ]; }
 no_stop_hook() { ! stop_hook_waiting; }
 session_id() { ls "$CLAUDE_LARK_HOME/sessions" 2>/dev/null | head -1; }
 sdir() { echo "$CLAUDE_LARK_HOME/sessions/$(session_id)"; }
@@ -257,24 +264,37 @@ echo "运行目录：$RUN"
 tmux new-session -d -s "$TMUX_S" -x 160 -y 50 -c "$PROJ" \
     "CLAUDE_LARK_HOME='$CLAUDE_LARK_HOME' CLAUDE_LARK_CLI='$FAKE' FAKE_LARK_LOG='$FAKE_LARK_LOG' \
 FAKE_LARK_EVENTS='$FAKE_LARK_EVENTS' CLAUDE_LARK_WAIT_SECONDS=${WAIT_SECONDS} \
-CLAUDE_CODE_STOP_HOOK_BLOCK_CAP=1000 claude --model $MODEL --permission-mode default"
+CLAUDE_LARK_IDLE_SECONDS=${IDLE_SECONDS} \
+claude --model $MODEL --permission-mode default --setting-sources project,local"
 
 PANE_PID="$(tmux list-panes -t "$TMUX_S" -F '#{pane_pid}' | head -1)"
 
-# 新目录首次启动有信任对话框
-if wait_for 30 pane_has "trust"; then
-    sleep 1
-    if pane | grep -qE '❯ *1\. *Yes'; then
+# 启动时可能依次出现：信任目录对话框、外部 import 对话框。只看当前屏幕，逐个处理。
+screen() { tmux capture-pane -p -t "$TMUX_S" 2>/dev/null; }
+end_dialogs=$((SECONDS + 60))
+while [ "$SECONDS" -lt "$end_dialogs" ]; do
+    cur="$(screen)"
+    if grep -qF "Yes, I trust this folder" <<<"$cur"; then
+        if grep -qE '❯ *(1\. *)?Yes, I trust' <<<"$cur"; then
+            tmux send-keys -t "$TMUX_S" Enter
+        else
+            tmux send-keys -t "$TMUX_S" Down
+            sleep 0.3
+            tmux send-keys -t "$TMUX_S" Enter
+        fi
+        sleep 2
+    elif grep -qF "external imports" <<<"$cur"; then
+        # 默认选项是"不加载外部 import"，测试不需要它们
         tmux send-keys -t "$TMUX_S" Enter
+        sleep 2
+    elif grep -qF "? for shortcuts" <<<"$cur"; then
+        break
     else
-        tmux send-keys -t "$TMUX_S" Down
-        sleep 0.3
-        tmux send-keys -t "$TMUX_S" Enter
+        sleep 1
     fi
-fi
-if ! wait_for 30 pane_has "? for shortcuts"; then
-    sleep 3
-fi
+done
+# 输入框刚出现时按键可能被吞掉，多等一会儿
+sleep 5
 
 # ---------- 场景 ----------
 
@@ -306,49 +326,26 @@ s1() {
 }
 
 s9() {
-    # 场景 1 之后会话空闲，Stop hook 等 WAIT_SECONDS 秒后应出现一次 waiting 回合
-    local sd tr n0
-    sd="$(sdir)"
+    # 场景 1 之后会话空闲，后台等待进程等 IDLE_SECONDS 秒后应唤醒一次保活回合
+    local tr n0
     n0=$(log_lines)
-    blocks_ge1() { [ "$(cat "$sd/counter_blocks" 2>/dev/null || echo 0)" -ge 1 ]; }
-    if ! wait_for $((WAIT_SECONDS + TIMEOUT)) blocks_ge1; then
-        fail "9 续命" "counter_blocks 没有增加"
-        return
-    fi
     tr="$(ls "$HOME"/.claude/projects/*/"$(session_id)".jsonl 2>/dev/null | head -1)"
-    keepalive_answered() {
-        python3 - "${tr}" <<'PY'
-import json, sys
-seen_reason = False
-for line in open(sys.argv[1], encoding="utf-8"):
-    try:
-        d = json.loads(line)
-    except ValueError:
-        continue
-    s = json.dumps(d, ensure_ascii=False)
-    if "claude-lark 保活" in s:
-        seen_reason = True
-        continue
-    msg = d.get("message") or {}
-    if seen_reason and d.get("type") == "assistant":
-        for c in msg.get("content") or []:
-            if isinstance(c, dict) and c.get("type") == "text" and "waiting" in c.get("text", "").lower():
-                sys.exit(0)
-sys.exit(1)
-PY
-    }
-    if [ -z "${tr}" ] || ! wait_for $TIMEOUT keepalive_answered; then
-        fail "9 续命" "transcript 里没有保活回合的 waiting 回复（${tr}）"
+    keepalive_seen() { grep -qF "claude-lark 保活" "${tr}"; }
+    if [ -z "${tr}" ] || ! wait_for $((IDLE_SECONDS + TIMEOUT)) keepalive_seen; then
+        fail "9 保活" "transcript 里没有保活回合（${tr}）"
         return
     fi
-    # waiting 回合结束后的 Stop hook 不能把 waiting 发到群里
-    wait_idle_bridged
-    sleep 2
-    if sends_since "$n0" | grep -qi waiting; then
-        fail "9 续命" "fake 日志里发送了 waiting"
+    # 保活回合结束后，Stop hook 不能把它的回复发到群里，并重新进入等待
+    sleep 5
+    if ! wait_idle_bridged; then
+        fail "9 保活" "保活回合之后没有等待进程"
         return
     fi
-    pass "9 续命（${WAIT_SECONDS}s 后出现 waiting 回合，未发送 waiting）"
+    if [ "$(send_count_since "$n0")" != 0 ]; then
+        fail "9 保活" "保活回合的回复发到了群里：$(sends_since "$n0" | tr '\n' ' ')"
+        return
+    fi
+    pass "9 保活（${IDLE_SECONDS}s 后出现保活回合，回复没有发到群里）"
 }
 
 s2() {
@@ -448,30 +445,123 @@ s7() {
 }
 
 s6() {
+    # 后台在等飞书消息时，终端直接输入（不按 Esc）
     local n0
     if ! wait_idle_bridged; then
-        fail "6 Esc 拿回终端" "Stop hook 不在等待"
+        fail "6 终端直接输入" "后台等待进程不在"
         return
     fi
     n0=$(log_lines)
-    tmux send-keys -t "$TMUX_S" Escape
-    if ! wait_for 15 no_stop_hook; then
-        fail "6 Esc 拿回终端" "Esc 后 Stop hook 仍在运行"
-        return
-    fi
-    sleep 1
     send_text "只回复 LOCAL"
     if ! wait_for $TIMEOUT sent_since "$n0" "💻 终端：只回复 LOCAL"; then
-        fail "6 Esc 拿回终端" "群里没有收到 💻 终端：只回复 LOCAL"
+        fail "6 终端直接输入" "群里没有收到 💻 终端：只回复 LOCAL"
         return
     fi
-    # 回复内容由模型决定（haiku 偶尔不照抄 LOCAL），这里只要求这一轮的回复发到了群里
     if ! wait_for $TIMEOUT reply_after "$n0" "💻 终端：只回复 LOCAL"; then
-        fail "6 Esc 拿回终端" "终端这一轮的回复没有发到群里"
+        fail "6 终端直接输入" "终端这一轮的回复没有发到群里"
+        return
+    fi
+    sleep 3
+    if [ "$(stop_hook_count)" != 1 ]; then
+        fail "6 终端直接输入" "等待进程数是 $(stop_hook_count)，应为 1"
+        return
+    fi
+    pass "6 终端直接输入（不按 Esc，输入已镜像，回复已发到群里，等待进程只有 1 个）"
+}
+
+s12() {
+    # 终端一轮还在进行时，飞书消息到达：两边都要被处理
+    local n0
+    wait_idle_bridged
+    n0=$(log_lines)
+    send_text "写一段大约 300 字的介绍杭州的文字，最后一行只写 LOCAL2"
+    sleep 2
+    inject "只回复 FEISHU2"
+    if ! wait_for $TIMEOUT sent_since "$n0" "LOCAL2"; then
+        fail "12 终端与飞书同时输入" "群里没有收到含 LOCAL2 的回复"
+        return
+    fi
+    if ! wait_for $TIMEOUT sent_since "$n0" "FEISHU2"; then
+        fail "12 终端与飞书同时输入" "飞书消息没有被处理：$(sends_since "$n0" | tr '\n' ' ')"
         return
     fi
     wait_idle_bridged
-    pass "6 Esc 拿回终端（终端输入已镜像到群）"
+    sleep 3
+    if [ "$(stop_hook_count)" != 1 ]; then
+        fail "12 终端与飞书同时输入" "等待进程数是 $(stop_hook_count)，应为 1"
+        return
+    fi
+    pass "12 终端与飞书同时输入（两条都处理了，等待进程只有 1 个）"
+}
+
+s14() {
+    # 飞书消息唤醒的回合被 Esc 打断（Stop hook 不触发），之后的飞书消息仍要投递
+    local n0 n1
+    wait_idle_bridged
+    n0=$(log_lines)
+    inject "写一篇大约 1500 字的文章介绍西湖的历史，分成 6 节"
+    working() { pane | grep -qF "esc to interrupt"; }
+    if ! wait_for $TIMEOUT working; then
+        fail "14 Esc 打断飞书回合" "回合没有开始"
+        return
+    fi
+    sleep 3
+    tmux send-keys -t "$TMUX_S" Escape
+    if ! wait_for 20 pane_has "Interrupted"; then
+        fail "14 Esc 打断飞书回合" "终端没有出现 Interrupted"
+        return
+    fi
+    sleep 3
+    if ! stop_hook_waiting; then
+        fail "14 Esc 打断飞书回合" "打断后没有后台等待进程"
+        return
+    fi
+    n1=$(log_lines)
+    inject "只回复 AFTER14"
+    if ! wait_for $TIMEOUT sent_since "$n1" "AFTER14"; then
+        fail "14 Esc 打断飞书回合" "打断后的飞书消息没有投递"
+        return
+    fi
+    wait_idle_bridged
+    pass "14 Esc 打断飞书回合（之后的飞书消息照常投递）"
+}
+
+s13() {
+    # 选择题在终端作答：飞书侧收到"已在终端处理"，下一条飞书消息照常作为 prompt
+    local n0 n1
+    wait_idle_bridged
+    n0=$(log_lines)
+    inject "用 AskUserQuestion 工具问我一个单选题：喜欢什么颜色，选项依次是 红色、绿色、蓝色。拿到答案后只回复：答案是<颜色>"
+    if ! wait_for $TIMEOUT sent_since "$n0" "回复序号"; then
+        fail "13 选择题终端作答" "群里没有收到提问"
+        return
+    fi
+    if ! wait_for 20 pane_has "蓝色"; then
+        fail "13 选择题终端作答" "终端没有显示选项框"
+        return
+    fi
+    sleep 1
+    tmux send-keys -t "$TMUX_S" Enter
+    if ! wait_for $TIMEOUT sent_since "$n0" "已在终端处理"; then
+        sleep 2
+        tmux send-keys -t "$TMUX_S" Enter  # 有的版本多一步提交确认
+    fi
+    if ! wait_for $TIMEOUT sent_since "$n0" "已在终端处理"; then
+        fail "13 选择题终端作答" "群里没有收到 已在终端处理"
+        return
+    fi
+    if ! wait_for $TIMEOUT sent_since "$n0" "答案是" "红色"; then
+        fail "13 选择题终端作答" "最终回复里没有第一个选项 红色：$(sends_since "$n0" | tr '\n' ' ')"
+        return
+    fi
+    wait_idle_bridged
+    n1=$(log_lines)
+    inject "只回复 AFTER13"
+    if ! wait_for $TIMEOUT sent_since "$n1" "AFTER13"; then
+        fail "13 选择题终端作答" "之后的飞书消息没有作为 prompt 处理"
+        return
+    fi
+    pass "13 选择题终端作答（飞书收到 已在终端处理，之后的消息照常投递）"
 }
 
 s8() {
@@ -514,7 +604,7 @@ s8() {
     fi
 }
 
-# 桥接开着、会话回到终端（Stop hook 不在等待）。桥接没开就先 /lark 重新开启。
+# 桥接开着、会话空闲。桥接没开就先 /lark 重新开启。
 bridged_at_terminal() {
     local sd n0
     sd="$(sdir)"
@@ -530,14 +620,7 @@ bridged_at_terminal() {
             return 1
         fi
     fi
-    # 已经在终端（比如刚 /compact 过）就没有 Stop hook 在等，不用按 Esc
-    if wait_for 5 stop_hook_waiting; then
-        tmux send-keys -t "$TMUX_S" Escape
-        if ! wait_for 15 no_stop_hook; then
-            echo "Esc 后 Stop hook 仍在运行"
-            return 1
-        fi
-    fi
+    # 后台等待进程不占终端，直接输入即可
     sleep 1
     [ -e "$sd/enabled" ] || { echo "enabled 不存在"; return 1; }
 }
@@ -594,7 +677,7 @@ s10() {
 
 s1
 if [ "$FAILED" -eq 0 ]; then
-    for s in 9 2 3 4 5 7 6 8 11 10; do
+    for s in 9 2 3 4 5 13 14 7 6 12 8 11 10; do
         want "$s" && "s$s"
     done
 fi

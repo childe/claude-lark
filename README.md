@@ -11,7 +11,9 @@ You type `/lark` in an interactive Claude Code session. The session is bound to 
 prompt of the same session (full context kept), Claude's final reply of every turn is posted back to
 the group, and permission prompts and `AskUserQuestion` multiple-choice questions are forwarded to
 the group so you can answer them from your phone. Prompts you type in the terminal are mirrored to
-the group too, marked `💻 终端`. No restart and no launch flags: it is built on Claude Code hooks plus
+the group too, marked `💻 终端`. The terminal stays usable the whole time: the hook that waits for
+group messages runs in the background, so you can type in the terminal or in the group, in any
+order, without pressing anything first. No restart and no launch flags: it is built on Claude Code hooks plus
 one slash command, with a small background listener process that is shared by all sessions. Runtime
 is the Python standard library only.
 
@@ -21,10 +23,10 @@ is the Python standard library only.
  /lark  -----------------> bind session  ----->  polls the group as you <---- you (phone): "run the tests"
                            to a group            (one per machine)
  turn ends ------ Stop hook: send final reply ------------------------------> final reply
-                       |    then wait for the next group message
-                       |<------ inbox <------ message from you ------------- "now fix the failures"
+                       |    then wait in the background (terminal stays free)
+ wakes up <------------|<------ inbox <------ message from you ------------- "now fix the failures"
  tool needs approval -- PermissionRequest hook ------------------------------> "Allow `rm -rf build`?"
-                       |<------ inbox <---------------------------------------- "同意" / "拒绝"
+ (terminal dialog too) |<------ inbox <---------------------------------------- "同意" / "拒绝"
 ```
 
 Sessions with the bridge off are untouched: every hook exits 0 immediately with empty output.
@@ -34,12 +36,14 @@ Sessions with the bridge off are untouched: every hook exits 0 immediately with 
 claude-lark 把一个**正在运行**的 Claude Code 会话桥接到飞书群，方便离开电脑后在手机上继续指挥它。
 
 - 在终端里敲 `/lark [群名]`：自动建群（或绑定已有群，需提供 `oc_` 开头的 chat_id）并开启同步。
-- 群里发的消息进入同一个会话；每轮的最终回复发回群里；权限确认和选择题也转到群里，回"同意/拒绝"或编号即可。
-- 回到电脑前：先按 `Esc` 拿回终端，再 `/lark off` 停止同步（群里发 `/off` 也行）。
+- 群里发的消息进入同一个会话；每轮的最终回复发回群里；权限确认和选择题也转到群里，回"同意/拒绝"或编号即可。终端里的确认框、选项框同时显示，哪边先答算哪边。
+- 终端和飞书可以同时用：等飞书消息的 hook 在后台运行，不占终端，回到电脑前直接在终端输入即可，不用按 `Esc`。想停止同步就 `/lark off`（群里发 `/off` 也行）。
+- 模型：Sonnet、Opus 实测可用；Haiku 会拒绝执行从飞书转进来的消息，不支持。
 - 安装：`git clone https://github.com/childe/claude-lark ~/.claude/lark-src && ~/.claude/lark-src/install.sh`，然后重启已经开着的 claude 会话。
 - 前置：Python ≥ 3.9、Claude Code ≥ 2.1.287、`lark-cli` ≥ 1.0.92，以及一个开了机器人能力的飞书自建应用（不需要订阅事件）。
 - 收消息：监听进程以**你的 user 身份**每 2 秒拉一次已开启群的消息，不占用应用的事件长连接，所以同一个应用被别的后端订阅着也不影响。
-- 限制：一次 `/lark` 之后最多连续约 1000 次 hook 阻塞（群消息回合和续命回合都算，终端里输入一次就清零）；resume 后不自动重连；不能从飞书远程启动 claude。
+- 限制：resume 后不自动重连；不能从飞书远程启动 claude。
+- 从旧版本升级：`git pull` 之后**重新运行 `install.sh`**（hook 配置变了），再重启已经开着的 claude 会话。
 - 把仓库链接贴给你的 AI 助手说"帮我装"也可以，见 [For AI agents](#for-ai-agents)。
 
 ## Prerequisites
@@ -89,7 +93,7 @@ What `install.sh` does, and what you should see (it is idempotent; run it again 
 1. Checks `python3` >= 3.9 and `lark-cli`. Failure: a line starting with `❌` and exit code 1, nothing is changed.
 2. Validates your `~/.claude/settings.json` before touching anything. A hand-broken file aborts the install untouched.
 3. Symlinks the repo to `~/.claude/lark/app` and `commands/lark.md` to `~/.claude/commands/lark.md`.
-4. Merges six hooks (`Stop`, `PermissionRequest`, `PreToolUse` with matcher `AskUserQuestion`, `UserPromptSubmit`, `SessionStart`, `SessionEnd`) and the env var `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP=1000` into `~/.claude/settings.json`, leaving everything else as it was. Output: `已更新 ... （已备份到 ...）` or `无需改动`.
+4. Merges six hook entries (`Stop` with `asyncRewake`, `PermissionRequest`, two `UserPromptSubmit` entries of which one is `asyncRewake`, `SessionStart`, `SessionEnd`) into `~/.claude/settings.json`, leaving everything else as it was. Entries written by older versions (a `PreToolUse` hook for `AskUserQuestion`, the env var `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP=1000`) are removed. Output: `已更新 ... （已备份到 ...）` or `无需改动`.
 5. Records the logged-in Feishu user as the only allowed owner: `已写入 ~/.claude/lark/config.json`.
 6. Runs `claude-lark doctor`. Every check line should start with `✅` and the last line should be `全部通过`. A `❌` line is followed by a `修复：` line telling you what to do; install itself still succeeds.
 
@@ -156,26 +160,31 @@ used by only one active session at a time.
 
 In the group (only the person who ran `lark-cli auth login` is listened to; others are ignored):
 
-- Any message becomes the next prompt. Messages that arrive while Claude is busy are queued and delivered together at the end of the turn, in order.
-- Permission prompts show the tool and the full command. Reply `同意`, `1` or `y` to allow; `拒绝`, `2` or `n` to deny. Anything else is **not** treated as approval. The terminal dialog stays open too: whoever answers first wins.
-- Multiple-choice questions arrive with numbered options: reply with the number (several: separated by commas), or free text for "Other".
+- Any message becomes the next prompt. When the session is idle, it wakes up right away. When Claude is busy, the message is handed to it during the turn (or at the end of it); several messages are merged in order. Nothing is dropped.
+- Permission prompts show the tool and the full command. Reply `同意`, `1` or `y` to allow; `拒绝`, `2` or `n` to deny. Anything else is **not** treated as approval. The terminal dialog stays open too: whoever answers first wins. If you answer in the terminal, the group gets `已在终端处理`.
+- Multiple-choice questions arrive with numbered options: reply with the number (several: separated by commas), or free text for "Other". The terminal shows the same options at the same time; whoever answers first wins.
 - `/off` ends the sync, same as `/lark off`.
 
-**Coming back to your computer: press `Esc` first** to take the terminal back from the waiting hook,
-then use the terminal as usual (what you type is still mirrored to the group). Type `/lark off` when
-you want syncing to stop.
+**The terminal stays usable.** The hook that waits for group messages runs in the background, so
+when you are back at the computer just type in the terminal; what you type is mirrored to the group
+and the reply goes to both. Type `/lark off` when you want syncing to stop.
+
+**Model.** Messages from the group reach Claude as hook output. Sonnet and Opus treat them as your
+prompts (the `/lark` command tells them to). Haiku refuses to act on them, so the bridge does not
+work with Haiku.
 
 ## Limitations
 
 - **One listener per Feishu app.** A Feishu app's message events must not be consumed by another machine or program at the same time, or each side receives only part of the messages. Use a separate app per machine, or stop the other consumer.
-- **About 1000 consecutive hook blocks.** To stay in the waiting state, the Stop hook keeps blocking turn after turn. Claude Code caps consecutive blocks (`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP=1000`), and every block counts: each turn that delivers a group message and each keep-alive turn (one per hour or so of silence). The counter resets when you type a prompt in the terminal. A reminder is sent to the group at the 950th block; at the cap the session stops waiting and says so in the group, and you need to come back to the terminal.
+- **A keep-alive turn about once a day.** A background hook can wait at most 24 hours. After about 24 hours of silence it wakes Claude once with a keep-alive prompt (Claude replies `waiting`, which is not sent to the group), and the next wait starts.
+- **Haiku is not supported.** See [Usage](#usage).
 - **Resume does not reconnect automatically.** After `claude --resume` the group binding is remembered, but you must type `/lark` to turn the bridge on again (if you resumed in the terminal, you are at the computer).
 - **`/clear`, `/resume` and exiting disconnect.** When the bridged conversation ends (`/clear`, switching with `/resume`, or quitting claude), the bridge is turned off and the group gets a notice: 会话已结束（/clear 或退出），桥接已断开。终端里敲 /lark 可重新连接. `/compact` keeps the bridge.
 - **No remote start.** Feishu cannot start `claude`. After a reboot, run `claude --resume` at the computer first.
 - **Single user.** Only the bound owner is listened to; no multi-person collaboration.
 - **Final replies only.** No mid-turn progress (commands run, files read) is sent.
 - **Group messages without @:** see the warning in Prerequisites; not yet verified on a live group.
-- **Versions and platforms.** Claude Code >= 2.1.287 (the versions it was tested on; hook behaviour is version-sensitive), `lark-cli` >= 1.0.92. macOS is tested; Linux is expected to work; Windows is not supported.
+- **Versions and platforms.** Claude Code >= 2.1.287 (the version it was tested on; the background wait relies on the `asyncRewake` hook option, and hook behaviour is version-sensitive; `claude-lark doctor` checks the version), `lark-cli` >= 1.0.92. macOS is tested; Linux is expected to work; Windows is not supported.
 - **Process detection.** claude installed via npm (a `node` or `bun` process running the claude script) is detected from the process name plus arguments; a differently packaged build that matches neither may make `/lark` answer that it cannot identify the claude process. Please run `claude-lark doctor` and open an issue.
 - It does not use Claude Code's channels mechanism (it needs launch flags).
 
@@ -186,8 +195,8 @@ you want syncing to stop.
 ~/.claude/lark-src/uninstall.sh --purge   # also deletes ~/.claude/lark/sessions without asking
 ```
 
-It disables the bridge in all sessions, stops the listener, removes only claude-lark's hooks and the
-`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` entry from `~/.claude/settings.json` (with a backup), and removes
+It disables the bridge in all sessions, stops the listener, removes only claude-lark's hooks (and the
+`CLAUDE_CODE_STOP_HOOK_BLOCK_CAP` entry older versions wrote) from `~/.claude/settings.json` (with a backup), and removes
 the two symlinks. Restart running claude sessions afterwards. Delete `~/.claude/lark-src` yourself if you like.
 
 ## Upgrade
@@ -196,8 +205,9 @@ the two symlinks. Restart running claude sessions afterwards. Delete `~/.claude/
 git -C ~/.claude/lark-src pull
 ```
 
-Since `~/.claude/lark/app` is a symlink to the clone, that is all. Re-run `install.sh` if a release
-note says hooks changed, and run `claude-lark doctor`.
+Since `~/.claude/lark/app` is a symlink to the clone, code changes take effect right away. When the
+hook configuration changed (for example the upgrade to the background wait), re-run `install.sh` and
+restart running claude sessions; `claude-lark doctor` reports outdated hooks.
 
 ## Development
 
@@ -207,7 +217,7 @@ Unit tests (stdlib only at runtime; pytest for tests):
 uv run --with pytest pytest tests -v
 ```
 
-End-to-end suite: drives a real interactive Claude Code in tmux (model: haiku) with a fake `lark-cli`.
+End-to-end suite: drives a real interactive Claude Code in tmux (model: sonnet) with a fake `lark-cli`.
 **It makes real model calls and costs tokens.** Needs `tmux`, a logged-in `claude`, `python3`.
 
 ```sh

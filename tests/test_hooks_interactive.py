@@ -55,11 +55,16 @@ def ask_input(questions=None, sid=SID):
             "session_id": sid,
             "transcript_path": "/x.jsonl",
             "cwd": "/work",
-            "hook_event_name": "PreToolUse",
+            "hook_event_name": "PermissionRequest",
             "tool_name": "AskUserQuestion",
             "tool_input": {"questions": QUESTIONS if questions is None else questions},
+            "permission_suggestions": [],
         }
     )
+
+
+def answers_of(out):
+    return out["hookSpecificOutput"]["decision"]["updatedInput"]["answers"]
 
 
 def arrive(*items):
@@ -189,7 +194,7 @@ def test_permission_ignores_replies_sent_before_prompt(bridged):
     assert hooks.MSG_PERM_HINT not in sent_texts(bridged())
     # the early "1" is still delivered, once, by the next Stop hook
     out = hooks.run("stop", stop_input(None), clock.now, clock.sleep)
-    assert json.loads(out)["reason"] == DELIVER_PREFIX + "1"
+    assert out == DELIVER_PREFIX + "1"
     assert state.peek_inbox(SID)[0] == []
     assert not (state.paths.home() / "sessions" / SID / "consumed.txt").exists()
 
@@ -221,13 +226,13 @@ def test_non_prefix_consumption_no_loss_no_duplicate(bridged):
     assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["a", "b"]
     clock2 = Clock()
     out = hooks.run("stop", stop_input(None), clock2.now, clock2.sleep)
-    assert json.loads(out)["reason"] == DELIVER_PREFIX + "a" + JOIN_SEP + "b"
+    assert out == DELIVER_PREFIX + "a" + JOIN_SEP + "b"
     assert state.peek_inbox(SID)[0] == []
     assert not (state.paths.home() / "sessions" / SID / "consumed.txt").exists()
     # a new message after everything is delivered exactly once
     state.append_inbox(SID, msg(5, "c", "500"))
     out = hooks.run("stop", stop_input(None), clock2.now, clock2.sleep)
-    assert json.loads(out)["reason"] == DELIVER_PREFIX + "c"
+    assert out == DELIVER_PREFIX + "c"
 
 
 def test_permission_timeout_returns_empty(bridged, monkeypatch):
@@ -337,19 +342,19 @@ def test_permission_sigterm_after_commit_keeps_result(bridged, monkeypatch):
 
 def test_ask_noop_when_not_enabled(fake):
     clock = Clock()
-    assert hooks.run("ask", ask_input(), clock.now, clock.sleep) == ""
+    assert hooks.run("permission", ask_input(), clock.now, clock.sleep) == ""
     assert fake() == []
 
 
 def test_ask_fills_answers(bridged):
     clock = Clock(arrive((2, msg(1, "2", "1"))))
-    out = json.loads(hooks.run("ask", ask_input(), clock.now, clock.sleep))
+    out = json.loads(hooks.run("permission", ask_input(), clock.now, clock.sleep))
     hso = out["hookSpecificOutput"]
-    assert hso["hookEventName"] == "PreToolUse"
-    assert hso["permissionDecision"] == "allow"
-    assert hso["updatedInput"]["questions"] == QUESTIONS
-    assert hso["updatedInput"]["answers"] == {"Which color?": "Blue"}
-    assert sent_texts(bridged()) == [format_questions(QUESTIONS)]
+    assert hso["hookEventName"] == "PermissionRequest"
+    assert hso["decision"]["behavior"] == "allow"
+    assert hso["decision"]["updatedInput"]["questions"] == QUESTIONS
+    assert hso["decision"]["updatedInput"]["answers"] == {"Which color?": "Blue"}
+    assert sent_texts(bridged()) == [format_questions(QUESTIONS), "✅ 已作答"]
     assert state.peek_inbox(SID)[0] == []
 
 
@@ -363,8 +368,8 @@ def test_ask_free_text_and_multi_question(bridged):
         }
     ]
     clock = Clock(arrive((1, msg(1, "紫色\n1,3", "1"))))
-    out = json.loads(hooks.run("ask", ask_input(qs), clock.now, clock.sleep))
-    assert out["hookSpecificOutput"]["updatedInput"]["answers"] == {
+    out = json.loads(hooks.run("permission", ask_input(qs), clock.now, clock.sleep))
+    assert answers_of(out) == {
         "Which color?": "紫色",
         "Which sizes?": "S, L",
     }
@@ -372,17 +377,15 @@ def test_ask_free_text_and_multi_question(bridged):
 
 def test_ask_uses_first_message_and_leaves_rest(bridged):
     clock = Clock(arrive((1, msg(1, "1", "100")), (1, msg(2, "另外改下标题", "200"))))
-    out = json.loads(hooks.run("ask", ask_input(), clock.now, clock.sleep))
-    assert out["hookSpecificOutput"]["updatedInput"]["answers"] == {
-        "Which color?": "Red"
-    }
+    out = json.loads(hooks.run("permission", ask_input(), clock.now, clock.sleep))
+    assert answers_of(out) == {"Which color?": "Red"}
     assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["另外改下标题"]
 
 
 def test_ask_timeout_returns_empty(bridged, monkeypatch):
     monkeypatch.setenv("CLAUDE_LARK_WAIT_SECONDS", "3")
     clock = Clock()
-    assert hooks.run("ask", ask_input(), clock.now, clock.sleep) == ""
+    assert hooks.run("permission", ask_input(), clock.now, clock.sleep) == ""
     assert sent_texts(bridged())[-1] == "已交回终端"
 
 
@@ -393,7 +396,7 @@ def test_ask_sigterm_returns_empty(bridged):
             hooks._on_sigterm(signal.SIGTERM, None)
 
     clock = Clock(on_sleep)
-    assert hooks.run("ask", ask_input(), clock.now, clock.sleep) == ""
+    assert hooks.run("permission", ask_input(), clock.now, clock.sleep) == ""
     assert sent_texts(bridged())[-1] == "已交回终端"
     assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["1"]
 
@@ -401,10 +404,8 @@ def test_ask_sigterm_returns_empty(bridged):
 def test_ask_ignores_messages_sent_before_prompt(bridged):
     state.append_inbox(SID, msg(1, "1", "100"))
     clock = Clock(arrive((2, msg(2, "2", "200"))))
-    out = json.loads(hooks.run("ask", ask_input(), clock.now, clock.sleep))
-    assert out["hookSpecificOutput"]["updatedInput"]["answers"] == {
-        "Which color?": "Blue"
-    }
+    out = json.loads(hooks.run("permission", ask_input(), clock.now, clock.sleep))
+    assert answers_of(out) == {"Which color?": "Blue"}
     assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["1"]
 
 
@@ -412,17 +413,15 @@ def test_ask_bad_questions_returns_empty(bridged):
     state.append_inbox(SID, msg(1, "1", "1"))
     clock = Clock()
     for qs in ([], "nope", [{"no_question": 1}]):
-        assert hooks.run("ask", ask_input(qs), clock.now, clock.sleep) == ""
+        assert hooks.run("permission", ask_input(qs), clock.now, clock.sleep) == ""
     assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["1"]
 
 
 def test_ask_sigterm_after_commit_keeps_result(bridged, monkeypatch):
     _sigterm_after_commit(monkeypatch)
     clock = Clock(arrive((1, msg(1, "2", "1"))))
-    out = json.loads(hooks.run("ask", ask_input(), clock.now, clock.sleep))
-    assert out["hookSpecificOutput"]["updatedInput"]["answers"] == {
-        "Which color?": "Blue"
-    }
+    out = json.loads(hooks.run("permission", ask_input(), clock.now, clock.sleep))
+    assert answers_of(out) == {"Which color?": "Blue"}
 
 
 # ------------------------------------------------------- Task 4 review fixes
@@ -434,29 +433,9 @@ def test_stop_sigterm_after_commit_keeps_result(bridged, monkeypatch):
     _sigterm_after_commit(monkeypatch)
     clock = Clock()
     out = hooks.run("stop", stop_input(), clock.now, clock.sleep)
-    assert json.loads(out)["reason"] == DELIVER_PREFIX + "hi"
-    assert state.get_counter(SID, "blocks") == 1
+    assert out == DELIVER_PREFIX + "hi"
+    assert isinstance(out, hooks.Rewake)
     assert hooks._term == {"defer": False, "pending": False}
-
-
-def test_stop_block_cap_on_message_delivery(bridged):
-    # M2
-    state.set_counter(SID, "blocks", 999)
-    state.append_inbox(SID, msg(1, "hi", "1"))
-    clock = Clock()
-    assert hooks.run("stop", stop_input("r"), clock.now, clock.sleep) == ""
-    assert sent_texts(bridged()) == ["r", "续命次数已用完，会话已空闲，回到电脑前继续"]
-    assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["hi"]
-    assert state.get_counter(SID, "blocks") == 999
-
-
-def test_stop_delivers_just_below_cap(bridged):
-    state.set_counter(SID, "blocks", 998)
-    state.append_inbox(SID, msg(1, "hi", "1"))
-    clock = Clock()
-    out = hooks.run("stop", stop_input("r"), clock.now, clock.sleep)
-    assert json.loads(out)["reason"] == DELIVER_PREFIX + "hi"
-    assert state.get_counter(SID, "blocks") == 999
 
 
 def test_prompt_hook_makes_no_inline_send(bridged, monkeypatch):
@@ -536,7 +515,7 @@ def test_interactive_lock_wait_respects_deadline(bridged, monkeypatch, event):
         clock = Clock(arrive((1, msg(1, "同意", "1"))))
         start = clock.t
         inp = perm_input() if event == "permission" else ask_input()
-        assert hooks.run(event, inp, clock.now, clock.sleep) == ""
+        assert hooks.run("permission", inp, clock.now, clock.sleep) == ""
         assert clock.t == pytest.approx(start + 3)
         assert sent_texts(bridged()) == []  # never prompted
         assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["同意"]
@@ -555,7 +534,7 @@ def test_interactive_lock_wait_sigterm(bridged, event):
 
         clock = Clock(on_sleep)
         inp = perm_input() if event == "permission" else ask_input()
-        assert hooks.run(event, inp, clock.now, clock.sleep) == ""
+        assert hooks.run("permission", inp, clock.now, clock.sleep) == ""
         assert clock.sleeps == 2
         assert sent_texts(bridged()) == []
     finally:
@@ -671,9 +650,9 @@ def test_cli_sigterm_after_run_does_not_lose_output(bridged, monkeypatch):
     out = SigtermOnWrite()
     before = signal.getsignal(signal.SIGTERM)
     monkeypatch.setattr(sys, "stdin", io.StringIO(stop_input("r")))
-    monkeypatch.setattr(sys, "stdout", out)
-    assert cli.main(["hook", "stop"]) == 0
-    assert json.loads(out.getvalue())["reason"] == DELIVER_PREFIX + "from cli"
+    monkeypatch.setattr(sys, "stderr", out)
+    assert cli.main(["hook", "stop"]) == 2
+    assert out.getvalue() == DELIVER_PREFIX + "from cli"
     assert signal.getsignal(signal.SIGTERM) is before
 
 
@@ -733,8 +712,73 @@ def test_ask_ignores_late_reply_created_before_prompt(bridged, monkeypatch):
             (3, msg(2, "2", "1761465600600")),
         )
     )
-    out = json.loads(hooks.run("ask", ask_input(), clock.now, clock.sleep))
-    assert out["hookSpecificOutput"]["updatedInput"]["answers"] == {
-        "Which color?": "Blue"
-    }
+    out = json.loads(hooks.run("permission", ask_input(), clock.now, clock.sleep))
+    assert answers_of(out) == {"Which color?": "Blue"}
     assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["1"]
+
+
+# ---------------------------------------- answered in the terminal (no SIGTERM)
+
+
+def _transcript(tmp_path, tool_name, tool_input):
+    p = tmp_path / "transcript.jsonl"
+    use = {"type": "tool_use", "id": "toolu_1", "name": tool_name, "input": tool_input}
+    p.write_text(json.dumps({"message": {"content": [use]}}) + "\n")
+    return p
+
+
+def _answer_in_terminal(p):
+    res = {"type": "tool_result", "tool_use_id": "toolu_1", "content": "done"}
+    with open(p, "a") as f:
+        f.write(json.dumps({"message": {"content": [res]}}) + "\n")
+
+
+def _with_transcript(inp, p):
+    d = json.loads(inp)
+    d["transcript_path"] = str(p)
+    return json.dumps(d)
+
+
+@pytest.mark.parametrize("kind", ["permission", "ask"])
+def test_answered_in_terminal_stops_waiting(bridged, tmp_path, kind):
+    if kind == "permission":
+        p = _transcript(tmp_path, "Bash", BASH_INPUT)
+        inp = _with_transcript(perm_input(), p)
+    else:
+        p = _transcript(tmp_path, "AskUserQuestion", {"questions": QUESTIONS})
+        inp = _with_transcript(ask_input(), p)
+
+    def on_sleep(c):
+        if c.sleeps == 2:
+            _answer_in_terminal(p)
+
+    clock = Clock(on_sleep)
+    assert hooks.run("permission", inp, clock.now, clock.sleep) == ""
+    assert clock.sleeps == 2
+    assert sent_texts(bridged())[-1] == "已在终端处理"
+    # a later Feishu message is a prompt, not this dialog's answer
+    state.append_inbox(SID, msg(1, "同意", "1"))
+    assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["同意"]
+
+
+def test_answered_in_terminal_while_queued_for_lock(bridged, tmp_path):
+    p = _transcript(tmp_path, "Bash", BASH_INPUT)
+    held = _hold_interactive_lock()
+    try:
+
+        def on_sleep(c):
+            if c.sleeps == 2:
+                _answer_in_terminal(p)
+
+        clock = Clock(on_sleep)
+        inp = _with_transcript(perm_input(), p)
+        assert hooks.run("permission", inp, clock.now, clock.sleep) == ""
+        assert sent_texts(bridged()) == []  # never prompted
+    finally:
+        held.close()
+
+
+def test_ask_answered_in_feishu_says_so(bridged):
+    clock = Clock(arrive((1, msg(1, "1", "1"))))
+    hooks.run("permission", ask_input(), clock.now, clock.sleep)
+    assert sent_texts(bridged())[-1] == "✅ 已作答"

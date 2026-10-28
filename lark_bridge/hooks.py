@@ -1,4 +1,5 @@
-"""Claude Code hook 处理。run() 返回要写到 stdout 的文本，出任何错都返回 ""。"""
+"""Claude Code hook 处理。run() 返回要写到 stdout 的文本（Rewake 写 stderr 并 exit 2），
+出任何错都返回 ""。"""
 
 import json
 import os
@@ -9,7 +10,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import feishu, paths, state
+from . import feishu, paths, state, transcript
 from .text import (
     DELIVER_PREFIX,
     JOIN_SEP,
@@ -21,11 +22,7 @@ from .text import (
 )
 
 POLL_SECONDS = 0.5
-BLOCK_CAP = 1000
-KEEPALIVE_WARN_AT = 950
 
-MSG_CAP_REACHED = "续命次数已用完，会话已空闲，回到电脑前继续"
-MSG_CAP_WARN = "剩余续命次数不多"
 TERMINAL_PREFIX = "💻 终端："
 MSG_ALLOWED = "✅ 已允许"
 MSG_DENIED = "❌ 已拒绝"
@@ -33,6 +30,7 @@ MSG_PERM_HINT = "上一条消息不是「同意/拒绝」，已被忽略；请�
 MSG_PERM_TIMEOUT = "等待超时，已交回终端"
 MSG_PERM_TERMINAL = "已在终端处理"
 MSG_ASK_HANDBACK = "已交回终端"
+MSG_ANSWERED = "✅ 已作答"
 DENY_MESSAGE = "用户在飞书上拒绝了"
 MSG_SESSION_ENDED = "会话已结束（/clear 或退出），桥接已断开。终端里敲 /lark 可重新连接"
 # 这些 SessionStart 来源意味着"换了一段对话"：resume 不自动接回飞书（spec 第 9 节）。
@@ -42,8 +40,17 @@ _START_DISCONNECT = ("startup", "resume", "clear")
 SHORT_SEND_TIMEOUT = 5
 
 
+class Rewake(str):
+    """asyncRewake hook 的输出：cli 把它写到 stderr 并以 exit 2 退出，
+    Claude Code 据此唤醒模型，把文本当作下一条指令。"""
+
+
+class ResolvedElsewhere(Exception):
+    """确认框 / 选项框已在终端处理（transcript 里出现了 tool_result）。"""
+
+
 class HookTerminated(BaseException):
-    """收到 SIGTERM（hook 超时或用户在终端按 Esc）。
+    """收到 SIGTERM（hook 超时，或会话结束时 Claude Code 结束 hook）。
 
     继承 BaseException，这样 feishu.send 等处的 `except Exception` 不会吞掉它。
     """
@@ -73,7 +80,14 @@ def _consume_final(sid, message_ids) -> None:
 
 
 def wait_seconds() -> int:
+    """权限 / 提问 hook 等飞书回复的时长（hook timeout 是 3600）。"""
     return int(os.environ.get("CLAUDE_LARK_WAIT_SECONDS") or 3540)
+
+
+def idle_seconds() -> int:
+    """后台等待进程单次等多久（hook timeout 是 86400）。到点后用保活唤醒一次，
+    这一轮结束时 Stop hook 再拉起新的等待进程。"""
+    return int(os.environ.get("CLAUDE_LARK_IDLE_SECONDS") or 86100)
 
 
 class Peeked(list):
@@ -82,12 +96,17 @@ class Peeked(list):
     offset: int = 0
 
 
-def wait_for_messages(sid, deadline: float, now, sleep, since: int = 0, accept=None):
+def wait_for_messages(
+    sid, deadline: float, now, sleep, since: int = 0, accept=None, watch=None
+):
     """每 POLL_SECONDS 秒 peek 一次（只看收件箱里 since 偏移之后到达的消息，
     且 accept(m) 为真的；accept 为 None 时不过滤）。
     有消息 → 返回 Peeked（不 commit）；到 deadline 或桥接被关闭 → 返回 None。
+    watch（ToolWatch）发现已在终端处理 → 抛 ResolvedElsewhere。
     SIGTERM 时 HookTerminated 向上抛出。"""
     while True:
+        if watch is not None and watch.resolved():
+            raise ResolvedElsewhere()
         msgs, offset = state.peek_inbox(sid, since)
         if accept is not None:
             msgs = [m for m in msgs if accept(m)]
@@ -140,7 +159,12 @@ def merge_texts(msgs) -> str:
 
 
 def _stop(sid, data, binding, start, now, sleep) -> str:
+    """asyncRewake 的 Stop hook：在后台运行，不占终端。
+
+    先把最终回复发到群里，然后（全会话只留一个等待进程）等飞书消息：
+    有消息 → Rewake(消息)，Claude 被唤醒处理；空闲太久 → Rewake(保活)。"""
     chat = binding.chat_id
+    state.set_counter(sid, "busy", 0)
     if state.get_counter(sid, "keepalive_pending") == 1:
         state.set_counter(sid, "keepalive_pending", 0)
     else:
@@ -148,35 +172,70 @@ def _stop(sid, data, binding, start, now, sleep) -> str:
         if isinstance(reply, str) and reply.strip():
             feishu.send(chat, reply)
 
-    msgs = wait_for_messages(sid, start + wait_seconds(), now, sleep)
-    if not msgs and not state.is_enabled(sid):
-        return ""
-    blocks = state.get_counter(sid, "blocks")
-    if blocks + 1 >= BLOCK_CAP:
-        # 消息留在收件箱里，用户回到终端后再处理
-        feishu.send(chat, MSG_CAP_REACHED)
-        return ""
-    if msgs:
-        reason = DELIVER_PREFIX + merge_texts(msgs)
-        _commit_final(sid, msgs.offset)
-        state.set_counter(sid, "blocks", blocks + 1)
-        return json.dumps({"decision": "block", "reason": reason}, ensure_ascii=False)
+    return _become_waiter(sid, start, now, sleep)
 
-    blocks += 1
-    state.set_counter(sid, "blocks", blocks)
-    state.set_counter(sid, "keepalive_pending", 1)
-    if blocks == KEEPALIVE_WARN_AT:
-        feishu.send(chat, MSG_CAP_WARN)
-    return json.dumps(
-        {"decision": "block", "reason": KEEPALIVE_REASON}, ensure_ascii=False
-    )
+
+def _wait(sid, data, binding, start, now, sleep) -> str:
+    """UserPromptSubmit 上的 asyncRewake hook：每个回合开始时补一个等待进程。
+
+    飞书消息唤醒的回合里，投递消息的那个等待进程已经退出；用户在终端按 Esc
+    打断回合时 Stop hook 不会触发。没有它，之后的飞书消息要等到下一次终端输入。"""
+    return _become_waiter(sid, start, now, sleep)
+
+
+def _become_waiter(sid, start, now, sleep) -> str:
+    waiter = state.try_lock_waiter(sid)
+    if waiter is None:
+        return ""  # 已有等待进程在等
+    try:
+        return _wait_and_deliver(sid, start + idle_seconds(), now, sleep)
+    finally:
+        waiter.close()
+
+
+def _wait_and_deliver(sid, deadline, now, sleep) -> str:
+    while True:
+        msgs = wait_for_messages(sid, deadline, now, sleep)
+        if msgs is None:
+            if not state.is_enabled(sid):
+                return ""
+            if state.get_counter(sid, "busy") == 1:
+                # 正在干活：这一轮结束时 Stop hook 会拉起新的等待进程
+                return ""
+            state.set_counter(sid, "keepalive_pending", 1)
+            return Rewake(KEEPALIVE_REASON)
+        # 权限 / 提问 hook 正在等飞书回复时不投递：消息可能是它的答案
+        lock = state.try_lock_interactive(sid)
+        if lock is None:
+            t = now()
+            if t >= deadline:
+                # 权限 / 提问 hook 只在干活时出现：这一轮结束时会有新的等待进程
+                return ""
+            sleep(min(POLL_SECONDS, deadline - t))
+            continue
+        try:
+            msgs, offset = state.peek_inbox(sid)
+            if not msgs:
+                continue
+            _commit_final(sid, offset)
+        finally:
+            lock.close()
+        state.set_counter(sid, "busy", 1)
+        return Rewake(DELIVER_PREFIX + merge_texts(msgs))
+
+
+# 等待进程唤醒模型时，Claude Code 把唤醒内容包成这样的 prompt，也会触发 UserPromptSubmit
+_NOTIFICATION_PREFIX = "<task-notification>"
 
 
 def _prompt(sid, data, binding, start, now, sleep) -> str:
-    state.set_counter(sid, "blocks", 0)
+    prompt = data.get("prompt")
+    if isinstance(prompt, str) and prompt.lstrip().startswith(_NOTIFICATION_PREFIX):
+        # 后台通知（飞书消息投递、保活等），不是终端输入：不镜像，保活标记也不动
+        return ""
+    state.set_counter(sid, "busy", 1)
     # 用户在终端发了新 prompt，下一次 Stop 的回复是真回复，不能当保活回复跳过
     state.set_counter(sid, "keepalive_pending", 0)
-    prompt = data.get("prompt")
     if isinstance(prompt, str) and prompt.strip():
         if not prompt.lstrip().startswith("/lark"):
             _spawn_mirror(sid, prompt)
@@ -235,10 +294,12 @@ def mirror(sid, file_path: str) -> None:
         feishu.log_exception("mirror")
 
 
-def _acquire_interactive(sid, deadline: float, now, sleep):
+def _acquire_interactive(sid, deadline: float, now, sleep, watch=None):
     """轮询拿交互锁。拿到 → 文件对象；到 deadline 或桥接被关闭 → None。
-    SIGTERM 时 HookTerminated 从 sleep 里向上抛出。"""
+    已在终端处理 → ResolvedElsewhere；SIGTERM 时 HookTerminated 从 sleep 里向上抛出。"""
     while True:
+        if watch is not None and watch.resolved():
+            raise ResolvedElsewhere()
         lock = state.try_lock_interactive(sid)
         if lock is not None:
             return lock
@@ -256,18 +317,27 @@ def _serialized(inner):
 
     def handler(sid, data, binding, start, now, sleep):
         deadline = start + wait_seconds()
-        lock = _acquire_interactive(sid, deadline, now, sleep)
+        watch = transcript.ToolWatch(
+            data.get("transcript_path"), data.get("tool_name"), data.get("tool_input")
+        )
+        watch.resolved()  # 先记下已有的同名同参调用
+        try:
+            lock = _acquire_interactive(sid, deadline, now, sleep, watch)
+        except ResolvedElsewhere:
+            return ""
         if lock is None:
             return ""
         try:
-            return inner(sid, data, binding, deadline, now, sleep)
+            return inner(sid, data, binding, deadline, now, sleep, watch)
         finally:
             lock.close()
 
     return handler
 
 
-def _permission(sid, data, binding, deadline, now, sleep) -> str:
+def _permission(sid, data, binding, deadline, now, sleep, watch=None) -> str:
+    if data.get("tool_name") == "AskUserQuestion":
+        return _ask(sid, data, binding, deadline, now, sleep, watch)
     chat = binding.chat_id
     tool_input = data.get("tool_input")
     if not isinstance(tool_input, dict):
@@ -280,7 +350,7 @@ def _permission(sid, data, binding, deadline, now, sleep) -> str:
     accept = _created_after(sent_at)
     try:
         while True:
-            msgs = wait_for_messages(sid, deadline, now, sleep, since, accept)
+            msgs = wait_for_messages(sid, deadline, now, sleep, since, accept, watch)
             if msgs is None:
                 if state.is_enabled(sid):
                     feishu.send(chat, MSG_PERM_TIMEOUT)
@@ -312,13 +382,14 @@ def _permission(sid, data, binding, deadline, now, sleep) -> str:
             # 整批都不是明确的同意/拒绝：消费掉，提示后继续等
             state.consume(sid, done)
             feishu.send(chat, MSG_PERM_HINT, timeout=SHORT_SEND_TIMEOUT)
-    except HookTerminated:
+    except (HookTerminated, ResolvedElsewhere):
         # 用户在终端处理了确认框
         feishu.send(chat, MSG_PERM_TERMINAL, timeout=SHORT_SEND_TIMEOUT)
         return ""
 
 
-def _ask(sid, data, binding, deadline, now, sleep) -> str:
+def _ask(sid, data, binding, deadline, now, sleep, watch=None) -> str:
+    """AskUserQuestion 的 PermissionRequest：终端的选项框同时显示，谁先答算谁的。"""
     chat = binding.chat_id
     tool_input = data.get("tool_input")
     questions = tool_input.get("questions") if isinstance(tool_input, dict) else None
@@ -335,7 +406,7 @@ def _ask(sid, data, binding, deadline, now, sleep) -> str:
     _, sent_at = feishu.send_with_time(chat, format_questions(questions))
     try:
         msgs = wait_for_messages(
-            sid, deadline, now, sleep, since, _created_after(sent_at)
+            sid, deadline, now, sleep, since, _created_after(sent_at), watch
         )
         if msgs is None:
             if state.is_enabled(sid):
@@ -347,12 +418,18 @@ def _ask(sid, data, binding, deadline, now, sleep) -> str:
     except HookTerminated:
         feishu.send(chat, MSG_ASK_HANDBACK, timeout=SHORT_SEND_TIMEOUT)
         return ""
+    except ResolvedElsewhere:
+        feishu.send(chat, MSG_PERM_TERMINAL, timeout=SHORT_SEND_TIMEOUT)
+        return ""
+    feishu.send(chat, MSG_ANSWERED, timeout=SHORT_SEND_TIMEOUT)
     return json.dumps(
         {
             "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
-                "updatedInput": {**tool_input, "answers": answers},
+                "hookEventName": "PermissionRequest",
+                "decision": {
+                    "behavior": "allow",
+                    "updatedInput": {**tool_input, "answers": answers},
+                },
             }
         },
         ensure_ascii=False,
@@ -390,9 +467,10 @@ _SESSION_HANDLERS = {
 
 _HANDLERS = {
     "stop": _stop,
+    "wait": _wait,
     "prompt": _prompt,
+    # AskUserQuestion 也走 PermissionRequest（_permission 里分流）
     "permission": _serialized(_permission),
-    "ask": _serialized(_ask),
 }
 
 

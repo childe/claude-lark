@@ -246,9 +246,9 @@ def _consumed_lock(sid):
             fcntl.flock(f, fcntl.LOCK_UN)
 
 
-def try_lock_interactive(sid):
-    """非阻塞地拿会话的交互锁（权限 / 提问 hook 串行）。拿到返回文件对象（close 即释放），否则 None。"""
-    p = paths.session_dir(sid) / "interactive.lock"
+def _try_lock(sid, name):
+    """非阻塞地拿会话目录里的一把 flock。拿到返回文件对象（close 即释放），否则 None。"""
+    p = paths.session_dir(sid) / name
     p.parent.mkdir(parents=True, exist_ok=True)
     f = open(p, "a+")
     try:
@@ -260,6 +260,16 @@ def try_lock_interactive(sid):
         f.close()
         raise
     return f
+
+
+def try_lock_interactive(sid):
+    """会话的交互锁：权限 / 提问 hook 串行；等待进程投递前也要拿它。"""
+    return _try_lock(sid, "interactive.lock")
+
+
+def try_lock_waiter(sid):
+    """会话的等待锁：同一时刻只有一个后台等待进程。"""
+    return _try_lock(sid, "waiter.lock")
 
 
 def commit_cursor(sid, offset: int):

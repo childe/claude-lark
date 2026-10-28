@@ -39,7 +39,6 @@ def test_merge_into_empty():
     assert set(hooks) == {
         "Stop",
         "PermissionRequest",
-        "PreToolUse",
         "UserPromptSubmit",
         "SessionStart",
         "SessionEnd",
@@ -51,22 +50,49 @@ def test_merge_into_empty():
     assert stop == {
         "type": "command",
         "command": "$HOME/.claude/lark/app/bin/claude-lark hook stop",
-        "timeout": 3600,
+        "timeout": 86400,
+        "asyncRewake": True,
     }
+    assert "asyncRewake" not in hooks["PermissionRequest"][0]["hooks"][0]
     assert hooks["UserPromptSubmit"][0]["hooks"][0]["timeout"] == 30
     assert hooks["UserPromptSubmit"][0]["hooks"][0]["command"].endswith("hook prompt")
+    wait = hooks["UserPromptSubmit"][1]["hooks"][0]
+    assert wait["command"].endswith("hook wait")
+    assert wait["asyncRewake"] is True and wait["timeout"] == 86400
     assert hooks["PermissionRequest"][0]["hooks"][0]["command"].endswith(
         "hook permission"
     )
-    assert cfg["env"] == {"CLAUDE_CODE_STOP_HOOK_BLOCK_CAP": "1000"}
+    assert "env" not in cfg
     assert len(_ours(cfg)) == 6
 
 
-def test_ask_matcher_is_exactly_ask_user_question():
-    pre = settings.merge({})["hooks"]["PreToolUse"]
-    assert len(pre) == 1
-    assert pre[0]["matcher"] == "AskUserQuestion"
-    assert pre[0]["hooks"][0]["command"].endswith("hook ask")
+def test_merge_upgrades_old_install():
+    # 旧版本：同步 Stop hook、PreToolUse(AskUserQuestion)、BLOCK_CAP env
+    old = {
+        "env": {"CLAUDE_CODE_STOP_HOOK_BLOCK_CAP": "1000", "FOO": "1"},
+        "hooks": {
+            "Stop": [
+                {"hooks": [{"type": "command", "command": f"$HOME{MARK} hook stop"}]}
+            ],
+            "PreToolUse": [
+                {
+                    "matcher": "AskUserQuestion",
+                    "hooks": [{"type": "command", "command": f"$HOME{MARK} hook ask"}],
+                }
+            ],
+        },
+    }
+    assert not settings.has_hooks(old)
+    cfg = settings.merge(old)
+    assert "PreToolUse" not in cfg["hooks"]
+    assert cfg["env"] == {"FOO": "1"}
+    assert cfg["hooks"]["Stop"][0]["hooks"][0]["asyncRewake"] is True
+    assert settings.has_hooks(cfg)
+
+
+def test_merge_keeps_user_block_cap_value():
+    cfg = settings.merge({"env": {"CLAUDE_CODE_STOP_HOOK_BLOCK_CAP": "50"}})
+    assert cfg["env"] == {"CLAUDE_CODE_STOP_HOOK_BLOCK_CAP": "50"}
 
 
 def test_merge_idempotent():
@@ -112,7 +138,7 @@ def test_merge_replaces_tilde_spelling():
     }
     cfg = settings.merge(old)
     assert len(_ours(cfg)) == 6
-    assert cfg["hooks"]["Stop"][0]["hooks"][0]["timeout"] == 3600
+    assert cfg["hooks"]["Stop"][0]["hooks"][0]["timeout"] == 86400
 
 
 def test_remove_only_ours():
@@ -348,7 +374,7 @@ def test_odd_shapes_raise_settings_error(tmp_path):
 
 def test_has_hooks_checks_matcher():
     cfg = settings.merge({})
-    cfg["hooks"]["PreToolUse"][0]["matcher"] = "*"
+    del cfg["hooks"]["Stop"][0]["hooks"][0]["asyncRewake"]
     assert not settings.has_hooks(cfg)
     cfg = settings.merge({})
     cfg["hooks"]["PermissionRequest"][0]["matcher"] = "Bash"

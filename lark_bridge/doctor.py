@@ -9,6 +9,8 @@ from pathlib import Path
 from . import paths, settings
 
 MIN_CLI = (1, 0, 92)
+# Stop hook 的 asyncRewake（后台等待、exit 2 唤醒模型）在这个版本实测可用
+MIN_CLAUDE = (2, 1, 287)
 MIN_PY = (3, 9)
 _TIMEOUT = 30
 
@@ -71,6 +73,32 @@ def _check_cli(report):
         return False
     report(True, f"lark-cli {'.'.join(map(str, ver))}")
     return True
+
+
+def _check_claude(report):
+    try:
+        r = subprocess.run(
+            ["claude", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=_TIMEOUT,
+            stdin=subprocess.DEVNULL,
+        )
+        out = r.stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        report(False, f"找不到可用的 claude 命令：{e}", "安装 Claude Code")
+        return
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", out)
+    ver = tuple(int(x) for x in m.groups()) if m else None
+    want = ".".join(map(str, MIN_CLAUDE))
+    if ver is None or ver < MIN_CLAUDE:
+        report(
+            False,
+            f"Claude Code 版本 {out.strip() or '未知'} 低于 {want}",
+            "升级 Claude Code（claude update 或 brew upgrade claude-code）",
+        )
+        return
+    report(True, f"Claude Code {'.'.join(map(str, ver))}")
 
 
 READ_SCOPE = "im:message.group_msg:get_as_user"
@@ -174,6 +202,7 @@ def run() -> int:
                 print(f"   修复：{fix}")
 
     _check_python(report)
+    _check_claude(report)
     if _check_cli(report):
         oid = _check_auth(report)
     else:

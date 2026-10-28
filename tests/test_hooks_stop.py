@@ -119,6 +119,12 @@ def test_unknown_event_is_noop_even_when_enabled(bridged):
     assert bridged() == []
 
 
+def delivered(out):
+    """Stop hook 的投递：Rewake（cli 写 stderr、exit 2）。"""
+    assert isinstance(out, hooks.Rewake), repr(out)
+    return str(out)
+
+
 def test_stop_sends_reply_then_delivers_message(bridged):
     def on_sleep(c):
         if c.sleeps == 3:
@@ -126,17 +132,14 @@ def test_stop_sends_reply_then_delivers_message(bridged):
 
     clock = Clock(on_sleep)
     out = hooks.run("stop", stop_input("final reply"), clock.now, clock.sleep)
-    assert json.loads(out) == {
-        "decision": "block",
-        "reason": DELIVER_PREFIX + "下一步做什么",
-    }
+    assert delivered(out) == DELIVER_PREFIX + "下一步做什么"
     calls = bridged()
     assert calls[0][:4] == ["im", "+messages-send", "--as", "bot"]
     assert calls[0][calls[0].index("--chat-id") + 1] == "oc_test_chat"
     assert sent_texts(calls) == ["final reply"]
-    # consumed: cursor committed, counter bumped
+    # consumed: cursor committed; the session is busy with the delivered message
     assert state.peek_inbox(SID)[0] == []
-    assert state.get_counter(SID, "blocks") == 1
+    assert state.get_counter(SID, "busy") == 1
 
 
 def test_stop_delivers_backlog_queued_before_hook_started(bridged):
@@ -145,8 +148,7 @@ def test_stop_delivers_backlog_queued_before_hook_started(bridged):
     state.append_inbox(SID, msg(1, "first", "1700000000100"))
     clock = Clock()
     out = hooks.run("stop", stop_input(), clock.now, clock.sleep)
-    reason = json.loads(out)["reason"]
-    assert reason == DELIVER_PREFIX + "first" + JOIN_SEP + "second"
+    assert delivered(out) == DELIVER_PREFIX + "first" + JOIN_SEP + "second"
     assert clock.sleeps == 0
     assert state.peek_inbox(SID)[0] == []
 
@@ -155,10 +157,8 @@ def test_stop_create_time_sort_is_numeric(bridged):
     state.append_inbox(SID, msg(1, "later", "1000"))
     state.append_inbox(SID, msg(2, "earlier", "999"))
     clock = Clock()
-    reason = json.loads(hooks.run("stop", stop_input(), clock.now, clock.sleep))[
-        "reason"
-    ]
-    assert reason == DELIVER_PREFIX + "earlier" + JOIN_SEP + "later"
+    out = hooks.run("stop", stop_input(), clock.now, clock.sleep)
+    assert delivered(out) == DELIVER_PREFIX + "earlier" + JOIN_SEP + "later"
 
 
 def test_stop_skips_null_or_empty_reply(bridged):
@@ -170,31 +170,44 @@ def test_stop_skips_null_or_empty_reply(bridged):
     assert sent_texts(bridged()) == []
 
 
-def test_stop_keepalive_on_deadline(bridged, monkeypatch):
-    monkeypatch.setenv("CLAUDE_LARK_WAIT_SECONDS", "5")
+def test_stop_keepalive_on_idle_deadline(bridged, monkeypatch):
+    monkeypatch.setenv("CLAUDE_LARK_IDLE_SECONDS", "5")
     clock = Clock()
     start = clock.t
     out = hooks.run("stop", stop_input(), clock.now, clock.sleep)
-    assert json.loads(out) == {"decision": "block", "reason": KEEPALIVE_REASON}
+    assert delivered(out) == KEEPALIVE_REASON
     assert clock.t == pytest.approx(start + 5)
-    assert state.get_counter(SID, "blocks") == 1
     assert state.get_counter(SID, "keepalive_pending") == 1
 
 
-def test_stop_default_wait_is_3540(bridged):
+def test_stop_default_idle_wait_is_86100(bridged):
     clock = Clock()
     start = clock.t
     hooks.run("stop", stop_input(), clock.now, clock.sleep)
-    assert clock.t == pytest.approx(start + 3540)
+    assert clock.t == pytest.approx(start + 86100)
+
+
+def test_stop_no_keepalive_while_busy(bridged, monkeypatch):
+    # the user typed in the terminal while the waiter was waiting: a keepalive now
+    # would land mid-turn; the next Stop hook starts a fresh waiter instead
+    monkeypatch.setenv("CLAUDE_LARK_IDLE_SECONDS", "5")
+
+    def on_sleep(c):
+        if c.sleeps == 2:
+            hooks.run("prompt", prompt_input("/lark status"), c.now, c.sleep)
+
+    clock = Clock(on_sleep)
+    assert hooks.run("stop", stop_input(), clock.now, clock.sleep) == ""
+    assert state.get_counter(SID, "keepalive_pending") == 0
 
 
 def test_stop_skips_sending_keepalive_reply(bridged, monkeypatch):
-    monkeypatch.setenv("CLAUDE_LARK_WAIT_SECONDS", "1")
+    monkeypatch.setenv("CLAUDE_LARK_IDLE_SECONDS", "1")
     state.set_counter(SID, "keepalive_pending", 1)
     state.append_inbox(SID, msg(1, "hello", "1"))
     clock = Clock()
     out = hooks.run("stop", stop_input("waiting"), clock.now, clock.sleep)
-    assert json.loads(out)["reason"] == DELIVER_PREFIX + "hello"
+    assert delivered(out) == DELIVER_PREFIX + "hello"
     assert sent_texts(bridged()) == []
     assert state.get_counter(SID, "keepalive_pending") == 0
     # next real reply is sent again
@@ -203,29 +216,57 @@ def test_stop_skips_sending_keepalive_reply(bridged, monkeypatch):
     assert sent_texts(bridged()) == ["real answer"]
 
 
-def test_stop_keepalive_warns_once_at_950(bridged, monkeypatch):
-    monkeypatch.setenv("CLAUDE_LARK_WAIT_SECONDS", "1")
-    state.set_counter(SID, "blocks", 948)
-    state.set_counter(SID, "keepalive_pending", 1)
-    clock = Clock()
-    hooks.run("stop", stop_input("waiting"), clock.now, clock.sleep)
-    assert state.get_counter(SID, "blocks") == 949
-    assert sent_texts(bridged()) == []
-    hooks.run("stop", stop_input("waiting"), clock.now, clock.sleep)
-    assert state.get_counter(SID, "blocks") == 950
-    assert sent_texts(bridged()) == ["剩余续命次数不多"]
-    hooks.run("stop", stop_input("waiting"), clock.now, clock.sleep)
-    assert sent_texts(bridged()) == ["剩余续命次数不多"]
+def test_stop_single_waiter_per_session(bridged):
+    # a second Stop while a waiter holds the lock: sends its reply, then exits
+    held = state.try_lock_waiter(SID)
+    try:
+        state.append_inbox(SID, msg(1, "hi", "1"))
+        clock = Clock()
+        assert hooks.run("stop", stop_input("r2"), clock.now, clock.sleep) == ""
+        assert clock.sleeps == 0
+        assert sent_texts(bridged()) == ["r2"]
+        assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["hi"]
+    finally:
+        held.close()
+    out = hooks.run("stop", stop_input(None), clock.now, clock.sleep)
+    assert delivered(out) == DELIVER_PREFIX + "hi"
 
 
-def test_stop_gives_up_at_block_cap(bridged, monkeypatch):
-    monkeypatch.setenv("CLAUDE_LARK_WAIT_SECONDS", "1")
-    state.set_counter(SID, "blocks", 999)
-    state.set_counter(SID, "keepalive_pending", 1)
+def test_stop_waits_while_interactive_hook_pending(bridged):
+    # a permission / question hook holds the interactive lock: its answer must
+    # not be delivered as a prompt; the waiter delivers after the lock is free
+    state.append_inbox(SID, msg(1, "hi", "1"))
+    held = [state.try_lock_interactive(SID)]
+
+    def on_sleep(c):
+        if c.sleeps == 3:
+            held[0].close()
+
+    clock = Clock(on_sleep)
+    out = hooks.run("stop", stop_input(None), clock.now, clock.sleep)
+    assert clock.sleeps == 3
+    assert delivered(out) == DELIVER_PREFIX + "hi"
+
+
+def test_stop_interactive_pending_past_deadline_exits(bridged, monkeypatch):
+    monkeypatch.setenv("CLAUDE_LARK_IDLE_SECONDS", "2")
+    state.append_inbox(SID, msg(1, "hi", "1"))
+    held = state.try_lock_interactive(SID)
+    try:
+        clock = Clock()
+        assert hooks.run("stop", stop_input(None), clock.now, clock.sleep) == ""
+        assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["hi"]
+    finally:
+        held.close()
+
+
+def test_stop_releases_waiter_lock(bridged):
+    state.append_inbox(SID, msg(1, "hi", "1"))
     clock = Clock()
-    assert hooks.run("stop", stop_input("waiting"), clock.now, clock.sleep) == ""
-    assert sent_texts(bridged()) == ["续命次数已用完，会话已空闲，回到电脑前继续"]
-    assert state.get_counter(SID, "blocks") == 999
+    hooks.run("stop", stop_input(None), clock.now, clock.sleep)
+    lock = state.try_lock_waiter(SID)
+    assert lock is not None
+    lock.close()
 
 
 def test_stop_sigterm_leaves_inbox_unconsumed(bridged):
@@ -238,7 +279,6 @@ def test_stop_sigterm_leaves_inbox_unconsumed(bridged):
     assert hooks.run("stop", stop_input(), clock.now, clock.sleep) == ""
     msgs, _ = state.peek_inbox(SID)
     assert [m["text"] for m in msgs] == ["late"]
-    assert state.get_counter(SID, "blocks") == 0
     assert state.get_counter(SID, "keepalive_pending") == 0
     assert not (state.paths.home() / "errors.log").exists()
 
@@ -251,11 +291,10 @@ def test_stop_returns_when_disabled_while_waiting(bridged):
     clock = Clock(on_sleep)
     assert hooks.run("stop", stop_input(), clock.now, clock.sleep) == ""
     assert clock.sleeps == 2
-    assert state.get_counter(SID, "blocks") == 0
 
 
 def test_sigterm_handler_installed_and_restored(bridged, monkeypatch):
-    monkeypatch.setenv("CLAUDE_LARK_WAIT_SECONDS", "1")
+    monkeypatch.setenv("CLAUDE_LARK_IDLE_SECONDS", "1")
     before = signal.getsignal(signal.SIGTERM)
     seen = []
     clock = Clock(lambda c: seen.append(signal.getsignal(signal.SIGTERM)))
@@ -274,24 +313,66 @@ def test_stop_exception_is_logged_and_returns_empty(bridged, monkeypatch):
     assert "kaboom" in (state.paths.home() / "errors.log").read_text()
 
 
-def test_prompt_mirrors_terminal_input_and_resets_blocks(bridged):
-    state.set_counter(SID, "blocks", 42)
+def test_prompt_mirrors_terminal_input_and_marks_busy(bridged):
     state.set_counter(SID, "keepalive_pending", 1)
     clock = Clock()
     assert hooks.run("prompt", prompt_input("修一下 bug"), clock.now, clock.sleep) == ""
     assert _wait_until(lambda: sent_texts(bridged()) == ["💻 终端：修一下 bug"])
-    assert state.get_counter(SID, "blocks") == 0
+    assert state.get_counter(SID, "busy") == 1
     assert state.get_counter(SID, "keepalive_pending") == 0
     assert clock.sleeps == 0
 
 
+NOTIFICATION = (
+    "<task-notification>\n<summary>Stop hook feedback</summary>\n</task-notification>\n"
+    '<system-reminder>\nStop hook blocking error from command "Stop": x\n'
+    "</system-reminder>"
+)
+
+
+def test_prompt_ignores_wake_up_notification(bridged):
+    # 等待进程唤醒模型的回合也会触发 UserPromptSubmit：不是终端输入
+    state.set_counter(SID, "keepalive_pending", 1)
+    clock = Clock()
+    assert hooks.run("prompt", prompt_input(NOTIFICATION), clock.now, clock.sleep) == ""
+    assert state.get_counter(SID, "keepalive_pending") == 1
+    assert state.get_counter(SID, "busy") == 0
+    import time
+
+    time.sleep(0.5)
+    assert sent_texts(bridged()) == []
+
+
+def test_wait_delivers_without_sending_reply(bridged):
+    state.append_inbox(SID, msg(1, "hi", "1"))
+    clock = Clock()
+    out = hooks.run("wait", prompt_input("whatever"), clock.now, clock.sleep)
+    assert delivered(out) == DELIVER_PREFIX + "hi"
+    assert sent_texts(bridged()) == []
+
+
+def test_wait_exits_when_a_waiter_exists(bridged):
+    held = state.try_lock_waiter(SID)
+    try:
+        state.append_inbox(SID, msg(1, "hi", "1"))
+        clock = Clock()
+        assert hooks.run("wait", prompt_input("x"), clock.now, clock.sleep) == ""
+        assert clock.sleeps == 0
+    finally:
+        held.close()
+
+
+def test_wait_noop_when_not_enabled(fake):
+    clock = Clock()
+    assert hooks.run("wait", prompt_input("x"), clock.now, clock.sleep) == ""
+    assert clock.sleeps == 0
+
+
 def test_prompt_does_not_mirror_lark_command(bridged):
-    state.set_counter(SID, "blocks", 3)
     clock = Clock()
     assert hooks.run("prompt", prompt_input("/lark off"), clock.now, clock.sleep) == ""
     assert hooks.run("prompt", prompt_input("/lark"), clock.now, clock.sleep) == ""
     assert sent_texts(bridged()) == []
-    assert state.get_counter(SID, "blocks") == 0
 
 
 def test_send_failure_does_not_raise(bridged, monkeypatch):
@@ -303,7 +384,7 @@ def test_send_failure_does_not_raise(bridged, monkeypatch):
     state.append_inbox(SID, msg(1, "hi", "1"))
     clock = Clock()
     out = hooks.run("stop", stop_input("reply"), clock.now, clock.sleep)
-    assert json.loads(out)["reason"] == DELIVER_PREFIX + "hi"
+    assert delivered(out) == DELIVER_PREFIX + "hi"
 
 
 def test_send_missing_binary_does_not_raise(bridged, monkeypatch, tmp_path):
@@ -339,9 +420,20 @@ def test_cli_hook_subcommand(bridged, monkeypatch, capsys):
 
     state.append_inbox(SID, msg(1, "from cli", "1"))
     monkeypatch.setattr(sys, "stdin", io.StringIO(stop_input("r")))
+    # asyncRewake: message on stderr, exit 2 wakes the model
+    assert cli.main(["hook", "stop"]) == 2
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert cap.err == DELIVER_PREFIX + "from cli"
+
+
+def test_cli_hook_nothing_to_deliver_exits_0(bridged, monkeypatch, capsys):
+    import io
+
+    monkeypatch.setattr(sys, "stdin", io.StringIO(stop_input("r")))
+    state.set_enabled(SID, False)
     assert cli.main(["hook", "stop"]) == 0
-    out = capsys.readouterr().out
-    assert json.loads(out)["reason"] == DELIVER_PREFIX + "from cli"
+    assert capsys.readouterr() == ("", "")
 
 
 def test_bin_noop_subprocess(fake):
@@ -382,7 +474,6 @@ def test_bin_real_sigterm_while_waiting(bridged):
     assert p.returncode == 0 and out == "" and err == ""
     state.append_inbox(SID, msg(1, "after", "1"))
     assert [m["text"] for m in state.peek_inbox(SID)[0]] == ["after"]
-    assert state.get_counter(SID, "blocks") == 0
 
 
 # ---------------- final review: SessionStart / SessionEnd

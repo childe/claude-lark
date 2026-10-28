@@ -32,8 +32,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 def _hook(event: str) -> int:
-    """hook 入口：读 stdin，输出 hooks.run 的结果，永远 exit 0。"""
+    """hook 入口：读 stdin，输出 hooks.run 的结果。
+
+    结果是 hooks.Rewake 时写 stderr 并 exit 2（asyncRewake 唤醒模型），其他情况 exit 0。"""
     saved = None
+    code = 0
     try:
         import signal
 
@@ -46,10 +49,14 @@ def _hook(event: str) -> int:
         except (ValueError, OSError):
             pass
         out = hooks.run(event, sys.stdin.read(), hold_sigterm=True)
-        if out:
+        if isinstance(out, hooks.Rewake):
+            sys.stderr.write(out)
+            sys.stderr.flush()
+            code = 2
+        elif out:
             sys.stdout.write(out + "\n")
             sys.stdout.flush()
-    except BaseException:  # noqa: B036 - hook 绝不能以非 0 退出
+    except BaseException:  # noqa: B036 - 出错时绝不能以非 0 退出
         try:
             import traceback
 
@@ -66,7 +73,7 @@ def _hook(event: str) -> int:
             hooks._term["defer"] = False
         except BaseException:
             pass
-    return 0
+    return code
 
 
 def _command(argv: List[str]) -> int:
