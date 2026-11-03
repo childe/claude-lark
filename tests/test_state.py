@@ -1,5 +1,7 @@
 import os
 
+import pytest
+
 from lark_bridge import procs, state
 
 SID = "00000000-0000-0000-0000-000000000001"
@@ -191,3 +193,31 @@ def test_enabled_old_pid_only_format_is_not_enabled(lark_home):
 def test_start_time_of_dead_pid_is_empty():
     assert procs.start_time(999999) == ""
     assert procs.start_time(None) == ""
+
+
+@pytest.mark.skipif(not os.path.exists("/proc/self/stat"), reason="needs /proc")
+def test_start_time_uses_proc_ticks_immune_to_clock_changes(lark_home, monkeypatch):
+    """调系统时间会让 ps lstart 整秒漂移；/proc 的启动滴答数不受影响。"""
+    st = procs.start_time(os.getpid())
+    assert st.startswith("ticks:") and st[len("ticks:"):].isdigit()
+    state.set_enabled(SID, True, os.getpid())
+    monkeypatch.setattr(procs, "lstart", lambda pid: "Thu Jan  1 00:00:01 1970")
+    assert state.is_enabled(SID)
+
+
+def test_enabled_legacy_lstart_format_still_matches(lark_home):
+    """升级前写下的 lstart 格式仍按 lstart 比，不会一升级就断开。"""
+    f = lark_home / "sessions" / SID / "enabled"
+    f.parent.mkdir(parents=True)
+    f.write_text(f"{os.getpid()}\n{procs.lstart(os.getpid())}")
+    assert state.is_enabled(SID)
+
+
+def test_enabled_false_when_proc_ticks_differ(lark_home):
+    f = lark_home / "sessions" / SID / "enabled"
+    f.parent.mkdir(parents=True)
+    f.write_text(f"{os.getpid()}\nticks:1")
+    assert state.is_enabled(SID) is False
+    assert not f.exists()
+    log = (lark_home / "errors.log").read_text()
+    assert f"session {SID} disabled: claude pid {os.getpid()} start time changed" in log

@@ -19,9 +19,38 @@ def pid_alive(pid):
 
 
 def start_time(pid) -> str:
-    """进程启动时间（`ps -o lstart=`，C locale，空白归一）；取不到返回空串。
+    """进程启动时间的标识；取不到返回空串。
 
-    和 pid 一起记下来：pid 会被复用（比如重启之后），启动时间不会一样。"""
+    和 pid 一起记下来：pid 会被复用（比如重启之后），启动时间不会一样。
+
+    Linux 上用 /proc/<pid>/stat 第 22 个字段（开机后的时钟滴答数），返回
+    "ticks:<n>"。它不随系统时间变化；`ps -o lstart` 是用 当前时间 − uptime
+    推出来的，调系统时间（WSL 里常见）会让它整秒跳动，误判进程已换。
+    没有 /proc（macOS）时退回 lstart()。"""
+    ticks = _proc_start_ticks(pid)
+    if ticks:
+        return f"ticks:{ticks}"
+    return lstart(pid)
+
+
+def _proc_start_ticks(pid) -> str:
+    if not pid or pid <= 0:
+        return ""
+    try:
+        with open(f"/proc/{int(pid)}/stat") as f:
+            data = f.read()
+    except (OSError, ValueError):
+        return ""
+    # comm（第 2 个字段）可能含空格和括号，从最后一个 ')' 之后从第 3 个字段数起
+    fields = data[data.rfind(")") + 1 :].split()
+    if len(fields) < 20 or not fields[19].isdigit():
+        return ""
+    return fields[19]
+
+
+def lstart(pid) -> str:
+    """`ps -o lstart=`（C locale，空白归一）；取不到返回空串。会随系统时间漂移，
+    只用于没有 /proc 的系统，以及兼容旧格式的 enabled 文件。"""
     if not pid or pid <= 0:
         return ""
     try:

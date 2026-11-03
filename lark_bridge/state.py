@@ -7,7 +7,7 @@ import os
 from dataclasses import asdict, dataclass
 from typing import Optional
 
-from . import paths, procs
+from . import feishu, paths, procs
 
 
 @dataclass
@@ -62,15 +62,28 @@ def is_enabled(sid) -> bool:
     except ValueError:
         pid = None
     alive = pid is not None and bool(start) and procs.pid_alive(pid)
+    reason = (
+        "malformed enabled file"
+        if pid is None or not start
+        else f"claude pid {pid} gone"
+    )
     if alive:
-        now = procs.start_time(pid)
+        # 旧版本写的是 lstart 字符串，按原来的方式比，避免升级后误判断开
+        now = (
+            procs.start_time(pid)
+            if start.startswith("ticks:")
+            else procs.lstart(pid)
+        )
         # ps 偶尔取不到（进程刚好退出等）时无法否定，按 pid 存活判断
         alive = not now or now == start
+        reason = f"claude pid {pid} start time changed: {start!r} -> {now!r}"
     if not alive:
         try:
             f.unlink()
         except OSError:
             pass
+        else:
+            feishu.log_error(f"session {sid} disabled: {reason}")
     return alive
 
 
