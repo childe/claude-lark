@@ -39,6 +39,7 @@ claude-lark 把一个**正在运行**的 Claude Code 会话桥接到飞书群，
 - 群里发的消息进入同一个会话；每轮的最终回复发回群里；权限确认和选择题也转到群里，回"同意/拒绝"或编号即可。终端里的确认框、选项框同时显示，哪边先答算哪边。
 - 终端和飞书可以同时用：等飞书消息的 hook 在后台运行，不占终端，回到电脑前直接在终端输入即可，不用按 `Esc`。想停止同步就 `/lark off`（群里发 `/off` 也行）。
 - 模型：Sonnet、Opus 实测可用；Haiku 会拒绝执行从飞书转进来的消息，不支持。
+- 确认要走选项框：群里发来的文字到了 Claude 那里只是一条通知，Claude Code 规定不能把它当作确认，所以文字回"确认"批准不了下单、删除这类操作。`/lark` 会让 Claude 把需要确认的事改用选项框（`AskUserQuestion`）来问，选项框转到群里，回编号就是正式答复，auto 模式下也一样。
 - 安装：`git clone https://github.com/childe/claude-lark ~/.claude/lark-src && ~/.claude/lark-src/install.sh`，然后重启已经开着的 claude 会话。
 - 前置：Python ≥ 3.9、Claude Code ≥ 2.1.287、`lark-cli` ≥ 1.0.92，以及一个开了机器人能力的飞书自建应用（不需要订阅事件）。
 - 收消息：监听进程以**你的 user 身份**每 2 秒拉一次已开启群的消息，不占用应用的事件长连接，所以同一个应用被别的后端订阅着也不影响。
@@ -172,6 +173,13 @@ and the reply goes to both. Type `/lark off` when you want syncing to stop.
 **Model.** Messages from the group reach Claude as hook output. Sonnet and Opus treat them as your
 prompts (the `/lark` command tells them to). Haiku refuses to act on them, so the bridge does not
 work with Haiku.
+
+**Confirmations go through the question dialog.** Claude Code labels a group message as a
+notification, not user input, and tells Claude not to treat it as a confirmation. So a typed
+`确认` in the group does not approve an order, a deletion or any other risky step. The `/lark`
+command tells Claude to ask for every confirmation, choice or approval with `AskUserQuestion`
+instead of in text. That dialog is forwarded to the group, and your numbered reply goes back to
+Claude Code as the dialog's answer. This works in every permission mode, auto mode included.
 
 ## Limitations
 

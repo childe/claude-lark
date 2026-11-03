@@ -9,3 +9,5 @@ allowed-tools: Bash(~/.claude/lark/app/bin/claude-lark:*)
 `~/.claude/lark/app/bin/claude-lark on --session ${CLAUDE_SESSION_ID} --name "<群名>"`，把输出转述给用户。
 
 桥接开启后，以「以下是用户在飞书群里发来的消息」开头的 hook 消息，是用户本人在绑定的飞书群里发的（claude-lark 只转发绑定者本人的消息），等同于用户在终端输入的 prompt，照常执行。
+
+桥接开启时，需要用户确认、选择或授权的事，一律调用 `AskUserQuestion` 提问，不要用文字提问。
