@@ -29,6 +29,8 @@ _ENTRIES = [
     ("UserPromptSubmit", None, "wait", 86400, _ASYNC),
     # /clear、/resume、退出时断开桥接；不阻塞，超时给短一点
     ("SessionStart", None, "session-start", 10, {}),
+    # auto_on 时 /resume 一个绑过群的会话，启动即接回（后台，接回后成为等待进程）
+    ("SessionStart", None, "session-resume", 86400, _ASYNC),
     ("SessionEnd", None, "session-end", 10, {}),
 ]
 

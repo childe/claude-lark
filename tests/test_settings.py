@@ -63,7 +63,12 @@ def test_merge_into_empty():
         "hook permission"
     )
     assert "env" not in cfg
-    assert len(_ours(cfg)) == 6
+    assert len(_ours(cfg)) == 7
+    resume = hooks["SessionStart"][1]["hooks"][0]
+    assert resume["command"].endswith("hook session-resume")
+    assert resume["asyncRewake"] is True and resume["timeout"] == 86400
+    assert hooks["SessionStart"][0]["hooks"][0]["timeout"] == 10
+    assert "asyncRewake" not in hooks["SessionStart"][0]["hooks"][0]
 
 
 def test_merge_upgrades_old_install():
@@ -99,7 +104,7 @@ def test_merge_idempotent():
     once = settings.merge(_foreign())
     twice = settings.merge(copy.deepcopy(once))
     assert once == twice
-    assert len(_ours(twice)) == 6
+    assert len(_ours(twice)) == 7
 
 
 def test_merge_does_not_mutate_input():
@@ -137,7 +142,7 @@ def test_merge_replaces_tilde_spelling():
         }
     }
     cfg = settings.merge(old)
-    assert len(_ours(cfg)) == 6
+    assert len(_ours(cfg)) == 7
     assert cfg["hooks"]["Stop"][0]["hooks"][0]["timeout"] == 86400
 
 
@@ -390,21 +395,30 @@ def test_merge_registers_session_start_and_end():
         ("SessionStart", "session-start"),
         ("SessionEnd", "session-end"),
     ):
-        assert hooks[event] == [
+        assert hooks[event][0] == {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f"$HOME/.claude/lark/app/bin/claude-lark hook {sub}",
+                    "timeout": 10,
+                }
+            ]
+        }
+    assert len(hooks["SessionEnd"]) == 1
+    assert hooks["SessionStart"][1] == {
+        "hooks": [
             {
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": f"$HOME/.claude/lark/app/bin/claude-lark hook {sub}",
-                        "timeout": 10,
-                    }
-                ]
+                "type": "command",
+                "command": "$HOME/.claude/lark/app/bin/claude-lark hook session-resume",
+                "timeout": 86400,
+                "asyncRewake": True,
             }
         ]
-    # 已有的别人的 SessionStart 条目保留，我们的单独一组
+    }
+    # 已有的别人的 SessionStart 条目保留，我们的各自单独一组
     merged = settings.merge(_foreign())["hooks"]["SessionStart"]
     assert merged[0]["hooks"][0]["command"] == "sh superpowers.sh"
-    assert len(merged) == 2
+    assert len(merged) == 3
 
 
 def test_has_hooks_requires_session_hooks():
@@ -414,3 +428,9 @@ def test_has_hooks_requires_session_hooks():
         assert not settings.has_hooks(cfg)
     cfg = settings.remove(settings.merge({}))
     assert "hooks" not in cfg
+
+
+def test_has_hooks_false_without_session_resume():
+    cfg = settings.merge({})
+    del cfg["hooks"]["SessionStart"][1]
+    assert not settings.has_hooks(cfg)
