@@ -16,7 +16,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import feishu, paths, procs, state
+from . import feishu, meta, paths, procs, state
 from .text import render_content, strip_mentions
 
 NOT_BRIDGED = "当前没有会话在桥接，回到电脑前在终端敲 /lark"
@@ -25,6 +25,8 @@ UNSUPPORTED = "暂不支持该类型消息，请发文字"
 HANDLE_FAILED = "处理失败，请重发"
 NOTICE_INTERVAL = 600  # 同一个群的"没有会话在桥接"提示最多 10 分钟一次
 SEND_TIMEOUT = 10
+RENAME_RETRY = 60  # 改群名失败后同一 binding 多久内不重试
+RENAME_FAILED = "改群名失败，可能缺少 im:chat:update 权限，详见 errors.log"
 _TEXT_TYPES = {"text", "post"}
 POLL_INTERVAL = 2  # 开启中的群多久拉一次
 IDLE_POLL_INTERVAL = 60  # 已绑定但没开启的群多久拉一次（只为回"没有会话在桥接"）
@@ -306,6 +308,8 @@ class _Poller:
         self.idle_at = {}  # chat_id -> 上次拉取（monotonic）
         self.failing = set()
         self.seen = []  # 最近处理过的 message_id（兜底：拿不到 position 的消息）
+        self.rename_retry_at = {}  # session_id -> 改群名失败后可重试的时刻（monotonic）
+        self.rename_warned = set()  # 已在群里提示过改名失败的 session_id
 
     def targets(self) -> dict:
         out = {}
@@ -341,6 +345,65 @@ class _Poller:
             if chat in self.failing:
                 self.failing.discard(chat)
                 _log(f"poll {chat} recovered")
+        if stop.is_set():
+            return
+        try:
+            self.sync_names()
+        except Exception:
+            _log(f"sync names failed: {traceback.format_exc()}")
+
+    def sync_names(self) -> None:
+        """claude-lark 自己建的群跟着会话名（/rename 或自动起的名字）改群名。"""
+        for b in state.all_bindings():
+            try:
+                self._sync_name(b)
+            except Exception:
+                _log(f"sync name {b.session_id} failed: {traceback.format_exc()}")
+
+    def _sync_name(self, b) -> None:
+        sid = b.session_id
+        if not b.created_by_bridge or not state.is_enabled(sid):
+            return
+        m = meta.read(b.claude_pid, sid)
+        if m is None:
+            return
+        name = m.get("name")
+        name = name.strip() if isinstance(name, str) else ""
+        if not name:
+            return
+        chat = b.chat_id
+        if b.synced_name is None:
+            # 升级前的旧 binding：第一次只记基线，不改名
+
+            def baseline(x):
+                if x.chat_id == chat and x.synced_name is None:
+                    x.synced_name = name
+
+            state.update_binding(sid, baseline)
+            return
+        if name == b.synced_name:
+            return
+        retry_at = self.rename_retry_at.get(sid)
+        if retry_at is not None and _now() < retry_at:
+            return
+        try:
+            feishu.update_chat_name(chat, name, SEND_TIMEOUT)
+        except Exception as e:
+            feishu.log_error(f"listener: im +chat-update {chat} ({sid}) failed: {e}")
+            self.rename_retry_at[sid] = _now() + RENAME_RETRY
+            if sid not in self.rename_warned:
+                self.rename_warned.add(sid)
+                _reply(chat, RENAME_FAILED)
+            return
+        self.rename_retry_at.pop(sid, None)
+
+        def done(x):
+            # 改名期间换了群（/lark off 后重绑）就放弃写回
+            if x.chat_id == chat:
+                x.chat_name = name[:60]
+                x.synced_name = name
+
+        state.update_binding(sid, done)
 
     def poll_chat(self, chat: str, since: int, stop) -> None:
         cur = self.cursors.get(chat)
@@ -426,14 +489,16 @@ def is_running() -> bool:
     return _lock_held_by_other()
 
 
-def ensure_running() -> None:
-    """监听进程没在跑就在后台拉起一个。自身不抛出。"""
+def ensure_running() -> bool:
+    """监听进程没在跑就在后台拉起一个。自身不抛出。
+
+    监听进程已在跑或本次拉起成功返回 True；拉起出错（已写 errors.log）返回 False。"""
     try:
         # 与监听进程的退出决定（_try_exit）互斥：要么它看到我们刚开启的会话而留下，
         # 要么我们看到存活锁已放掉而拉起新进程
         with _pid_lock():
             if _lock_held_by_other():
-                return
+                return True
             log = paths.listener_log()
             log.parent.mkdir(parents=True, exist_ok=True)
             script = Path(__file__).resolve().parent.parent / "bin" / "claude-lark"
@@ -446,5 +511,7 @@ def ensure_running() -> None:
                     stderr=out,
                     env=dict(os.environ),
                 )
+        return True
     except Exception:
         feishu.log_exception("listener.ensure_running")
+        return False

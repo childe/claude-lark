@@ -10,7 +10,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import feishu, paths, state, transcript
+from . import commands, feishu, paths, procs, state, transcript
 from .text import (
     DELIVER_PREFIX,
     JOIN_SEP,
@@ -179,8 +179,42 @@ def _wait(sid, data, binding, start, now, sleep) -> str:
     """UserPromptSubmit 上的 asyncRewake hook：每个回合开始时补一个等待进程。
 
     飞书消息唤醒的回合里，投递消息的那个等待进程已经退出；用户在终端按 Esc
-    打断回合时 Stop hook 不会触发。没有它，之后的飞书消息要等到下一次终端输入。"""
+    打断回合时 Stop hook 不会触发。没有它，之后的飞书消息要等到下一次终端输入。
+
+    终端输入的镜像也只在这里做（prompt hook 只改计数器）：每次输入只有一个
+    wait 进程，镜像恰好一次，不需要和 prompt hook 判断谁先谁后。"""
+    return _mirror_and_wait(sid, data, start, now, sleep)
+
+
+def _mirror_and_wait(sid, data, start, now, sleep) -> str:
+    """已开启时处理本次输入：镜像（跳过特殊 prompt），再成为等待进程。"""
+    _mirror_input(sid, data.get("prompt"))
     return _become_waiter(sid, start, now, sleep)
+
+
+def _auto_wait(sid, data, start, now, sleep) -> str:
+    """未开启时的 wait hook：auto_on 下第一句之后自动建群（或重试开启）。
+
+    之后只看当前是否已开启，不看是不是本次调用开启的：建群或 resume 接回可能由另一条
+    路径在本次等 connect_lock 期间完成。已开启就补做这一句的计数器更新（prompt hook
+    先跑时看到未开启，什么都没做），再走与 _wait 相同的镜像与等待。"""
+    prompt = data.get("prompt")
+    commands.auto_connect(sid, "prompt", prompt if isinstance(prompt, str) else "")
+    if not state.is_enabled(sid):
+        return ""
+    _count_input(sid, prompt)
+    return _mirror_and_wait(sid, data, start, now, sleep)
+
+
+def _session_resume(sid, data, start, now, sleep) -> str:
+    """后台 SessionStart hook：auto_on 时 /resume 一个绑过群的会话，接回桥接。
+
+    从不建群。开启后成为等待进程。"""
+    if data.get("source") != "resume":
+        return ""
+    if commands.auto_connect(sid, "resume") and state.is_enabled(sid):
+        return _become_waiter(sid, start, now, sleep)
+    return ""
 
 
 def _become_waiter(sid, start, now, sleep) -> str:
@@ -229,17 +263,28 @@ _NOTIFICATION_PREFIX = "<task-notification>"
 
 
 def _prompt(sid, data, binding, start, now, sleep) -> str:
-    prompt = data.get("prompt")
+    _count_input(sid, data.get("prompt"))
+    # 镜像由 wait hook 做（见 _wait）
+    return ""
+
+
+def _count_input(sid, prompt) -> None:
+    """终端输入的计数器更新。"""
     if isinstance(prompt, str) and prompt.lstrip().startswith(_NOTIFICATION_PREFIX):
         # 后台通知（飞书消息投递、保活等），不是终端输入：不镜像，保活标记也不动
-        return ""
+        return
     state.set_counter(sid, "busy", 1)
     # 用户在终端发了新 prompt，下一次 Stop 的回复是真回复，不能当保活回复跳过
     state.set_counter(sid, "keepalive_pending", 0)
-    if isinstance(prompt, str) and prompt.strip():
-        if not prompt.lstrip().startswith("/lark"):
-            _spawn_mirror(sid, prompt)
-    return ""
+
+
+def _mirror_input(sid, prompt) -> None:
+    """终端输入镜像到群里：跳过空白、/lark 命令和后台通知。"""
+    if not isinstance(prompt, str) or not prompt.strip():
+        return
+    if prompt.lstrip().startswith(("/lark", _NOTIFICATION_PREFIX)):
+        return
+    _spawn_mirror(sid, prompt)
 
 
 _MIRROR_PREFIX = "mirror-"
@@ -450,12 +495,21 @@ def _session_end(sid, data) -> str:
 
 
 def _session_start(sid, data) -> str:
-    """SessionStart：一个已开启的 session_id 以 startup/resume/clear 开始，静默断开。"""
+    """SessionStart：一个已开启的 session_id 以 startup/resume/clear 开始，
+    enabled 记的不是当前 claude 进程就静默断开。
+
+    当前进程的 enabled 保留：session-resume hook 可能已经先接回了桥接。"""
     if data.get("source") in _START_DISCONNECT:
-        state.set_enabled(sid, False)
-        feishu.log_error(
-            f"session {sid} started ({data.get('source')}), stale bridge disabled"
-        )
+        pid = procs.find_claude_ancestor()
+        if pid is None:
+            state.set_enabled(sid, False)
+            removed = True
+        else:
+            removed = state.disable_if_foreign(sid, pid, procs.start_time(pid))
+        if removed:
+            feishu.log_error(
+                f"session {sid} started ({data.get('source')}), stale bridge disabled"
+            )
     return ""
 
 
@@ -517,9 +571,18 @@ def run(
             paths.session_dir(sid)
         except ValueError:
             return ""
+        if event == "session-resume":
+            # 不受 is_enabled 门控：它的作用就是在未开启时接回
+            saved = _install_sigterm()
+            return _session_resume(sid, data, start, now, sleep)
         session_handler = _SESSION_HANDLERS.get(event)
         handler = _HANDLERS.get(event)
-        if (handler is None and session_handler is None) or not state.is_enabled(sid):
+        if handler is None and session_handler is None:
+            return ""
+        if not state.is_enabled(sid):
+            if event == "wait":
+                saved = _install_sigterm()
+                return _auto_wait(sid, data, start, now, sleep)
             return ""
         if session_handler is not None:
             return session_handler(sid, data)

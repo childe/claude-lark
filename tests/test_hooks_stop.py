@@ -313,14 +313,29 @@ def test_stop_exception_is_logged_and_returns_empty(bridged, monkeypatch):
     assert "kaboom" in (state.paths.home() / "errors.log").read_text()
 
 
-def test_prompt_mirrors_terminal_input_and_marks_busy(bridged):
+def test_prompt_marks_busy_without_mirroring(bridged):
+    import time
+
     state.set_counter(SID, "keepalive_pending", 1)
     clock = Clock()
     assert hooks.run("prompt", prompt_input("修一下 bug"), clock.now, clock.sleep) == ""
-    assert _wait_until(lambda: sent_texts(bridged()) == ["💻 终端：修一下 bug"])
     assert state.get_counter(SID, "busy") == 1
     assert state.get_counter(SID, "keepalive_pending") == 0
     assert clock.sleeps == 0
+    time.sleep(0.5)
+    assert sent_texts(bridged()) == []
+
+
+def test_wait_mirrors_terminal_input(bridged):
+    held = state.try_lock_waiter(SID)  # 已有等待进程：wait 只镜像，立刻返回
+    try:
+        clock = Clock()
+        assert (
+            hooks.run("wait", prompt_input("修一下 bug"), clock.now, clock.sleep) == ""
+        )
+    finally:
+        held.close()
+    assert _wait_until(lambda: sent_texts(bridged()) == ["💻 终端：修一下 bug"])
 
 
 NOTIFICATION = (
@@ -339,6 +354,21 @@ def test_prompt_ignores_wake_up_notification(bridged):
     assert state.get_counter(SID, "busy") == 0
     import time
 
+    time.sleep(0.5)
+    assert sent_texts(bridged()) == []
+
+
+def test_wait_does_not_mirror_wake_up_notification(bridged):
+    import time
+
+    held = state.try_lock_waiter(SID)
+    try:
+        clock = Clock()
+        assert (
+            hooks.run("wait", prompt_input(NOTIFICATION), clock.now, clock.sleep) == ""
+        )
+    finally:
+        held.close()
     time.sleep(0.5)
     assert sent_texts(bridged()) == []
 
@@ -368,10 +398,17 @@ def test_wait_noop_when_not_enabled(fake):
     assert clock.sleeps == 0
 
 
-def test_prompt_does_not_mirror_lark_command(bridged):
-    clock = Clock()
-    assert hooks.run("prompt", prompt_input("/lark off"), clock.now, clock.sleep) == ""
-    assert hooks.run("prompt", prompt_input("/lark"), clock.now, clock.sleep) == ""
+def test_wait_does_not_mirror_lark_command(bridged):
+    import time
+
+    held = state.try_lock_waiter(SID)
+    try:
+        clock = Clock()
+        for p in ("/lark off", "/lark"):
+            assert hooks.run("wait", prompt_input(p), clock.now, clock.sleep) == ""
+    finally:
+        held.close()
+    time.sleep(0.5)
     assert sent_texts(bridged()) == []
 
 
@@ -594,16 +631,20 @@ def _wait_until(cond, timeout=15):
     return cond()
 
 
-def test_prompt_mirror_does_not_block_terminal(bridged, monkeypatch):
+def test_wait_mirror_is_detached(bridged, monkeypatch):
     import time
 
     monkeypatch.setenv("FAKE_LARK_SLEEP", "3")
-    clock = Clock()
-    t0 = time.monotonic()
-    out = hooks.run("prompt", prompt_input("修一下 bug"), clock.now, clock.sleep)
-    elapsed = time.monotonic() - t0
+    held = state.try_lock_waiter(SID)
+    try:
+        clock = Clock()
+        t0 = time.monotonic()
+        out = hooks.run("wait", prompt_input("修一下 bug"), clock.now, clock.sleep)
+        elapsed = time.monotonic() - t0
+    finally:
+        held.close()
     assert out == ""
-    assert elapsed < 1.5, f"prompt hook blocked {elapsed:.1f}s on the send"
+    assert elapsed < 1.5, f"wait hook blocked {elapsed:.1f}s on the send"
     # 后台进程稍后把它发出去，临时文件随后删掉
     assert _wait_until(lambda: sent_texts(bridged()) == ["💻 终端：修一下 bug"])
     sdir = state.paths.session_dir(SID)

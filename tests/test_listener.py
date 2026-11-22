@@ -9,7 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from lark_bridge import listener, paths, procs, state
+from conftest import write_meta
+from lark_bridge import feishu, listener, paths, procs, state
 
 SID = "00000000-0000-0000-0000-0000000000b1"
 SID2 = "00000000-0000-0000-0000-0000000000b2"
@@ -27,6 +28,7 @@ def fake(lark_home, tmp_path, monkeypatch):
     monkeypatch.delenv("FAKE_LARK_SLEEP", raising=False)
     monkeypatch.delenv("FAKE_LARK_EVENTS", raising=False)
     monkeypatch.delenv("FAKE_LARK_USER_SCOPE", raising=False)
+    monkeypatch.delenv("FAKE_LARK_UPDATE_FAIL", raising=False)
     listener._notice_at.clear()
     listener._owner_missing["logged"] = False
 
@@ -674,3 +676,243 @@ def test_item_to_event_maps_api_fields():
     assert e["create_time"] == "1761465600000" and e["mentions"] == []
     item["sender"] = {"id": "cli_test_app", "id_type": "app_id", "sender_type": "app"}
     assert listener.item_to_event(item, "oc_test_chat")["sender_id"] is None
+
+
+# ---------- ensure_running result ----------
+
+
+def test_ensure_running_reports_spawn_failure(fake, lark_home, monkeypatch):
+    def boom(*a, **k):
+        raise OSError("fork failed")
+
+    monkeypatch.setattr(listener, "_lock_held_by_other", lambda: False)
+    monkeypatch.setattr(listener.subprocess, "Popen", boom)
+    assert listener.ensure_running() is False
+    assert "listener.ensure_running" in (lark_home / "errors.log").read_text()
+
+
+def test_ensure_running_true_when_running(fake, monkeypatch):
+    spawned = []
+    monkeypatch.setattr(listener, "_lock_held_by_other", lambda: True)
+    monkeypatch.setattr(listener.subprocess, "Popen", lambda *a, **k: spawned.append(a))
+    assert listener.ensure_running() is True
+    assert spawned == []
+
+
+def test_ensure_running_true_after_spawn(fake, monkeypatch):
+    spawned = []
+    monkeypatch.setattr(listener, "_lock_held_by_other", lambda: False)
+    monkeypatch.setattr(listener.subprocess, "Popen", lambda *a, **k: spawned.append(a))
+    assert listener.ensure_running() is True
+    assert len(spawned) == 1
+
+
+# ---------- chat name follows session name ----------
+
+
+def _arg(c, flag):
+    return c[c.index(flag) + 1]
+
+
+def renames(calls):
+    return [_arg(c, "--name") for c in calls() if c[:2] == ["im", "+chat-update"]]
+
+
+def bind_auto(synced="rw-1", created=True, name="rw-1"):
+    state.save_binding(
+        state.Binding(
+            SID,
+            "oc_test_chat",
+            name,
+            "/work",
+            os.getpid(),
+            1.0,
+            created_by_bridge=created,
+            synced_name=synced,
+        )
+    )
+    state.set_enabled(SID, True, os.getpid())
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    t = [0.0]
+    monkeypatch.setattr(listener, "_now", lambda: t[0])
+    return t
+
+
+def test_rename_syncs_user_name(fake, claude_sessions, clock):
+    bind_auto(synced="rw-1")
+    write_meta(claude_sessions, os.getpid(), SID, name="新名字", source="user")
+    poller = listener._Poller(60)
+    _poll(poller)
+    assert renames(fake) == ["新名字"]
+    c = [c for c in fake() if c[:2] == ["im", "+chat-update"]][0]
+    assert c[:6] == ["im", "+chat-update", "--as", "bot", "--chat-id", "oc_test_chat"]
+    b = state.load_binding(SID)
+    assert (b.chat_name, b.synced_name) == ("新名字", "新名字")
+    _poll(poller)
+    assert renames(fake) == ["新名字"]  # 不重复改
+
+
+def test_rename_syncs_derived_name(fake, claude_sessions, clock):
+    bind_auto(synced="rw-1")
+    write_meta(claude_sessions, os.getpid(), SID, name="fix-login", source="derived")
+    _poll(listener._Poller(60))
+    assert renames(fake) == ["fix-login"]
+
+
+def test_rename_baseline_equal_does_nothing(fake, claude_sessions, clock):
+    bind_auto(synced="rw-1")
+    write_meta(claude_sessions, os.getpid(), SID, name="rw-1")
+    _poll(listener._Poller(60))
+    assert renames(fake) == []
+
+
+def test_rename_skips_bound_existing_chat(fake, claude_sessions, clock):
+    bind_auto(synced="rw-1", created=False)
+    write_meta(claude_sessions, os.getpid(), SID, name="新名字")
+    _poll(listener._Poller(60))
+    assert renames(fake) == []
+
+
+def test_rename_skips_disabled_session(fake, claude_sessions, clock):
+    bind_auto(synced="rw-1")
+    state.set_enabled(SID, False)
+    write_meta(claude_sessions, os.getpid(), SID, name="新名字")
+    _poll(listener._Poller(60))
+    assert renames(fake) == []
+
+
+@pytest.mark.parametrize("bad", ["foreign", "garbage", "missing", "blank"])
+def test_rename_skips_foreign_meta(fake, claude_sessions, clock, bad):
+    bind_auto(synced="rw-1")
+    f = claude_sessions / f"{os.getpid()}.json"
+    if bad == "foreign":
+        write_meta(claude_sessions, os.getpid(), SID2, name="别人的")
+    elif bad == "garbage":
+        f.write_text("{not json")
+    elif bad == "blank":
+        write_meta(claude_sessions, os.getpid(), SID, name="   ")
+    _poll(listener._Poller(60))
+    assert renames(fake) == []
+    assert state.load_binding(SID).synced_name == "rw-1"
+
+
+def test_rename_legacy_binding_records_baseline_only(fake, claude_sessions, clock):
+    bind_auto(synced=None)
+    write_meta(claude_sessions, os.getpid(), SID, name="当前名")
+    poller = listener._Poller(60)
+    _poll(poller)
+    assert renames(fake) == []
+    assert state.load_binding(SID).synced_name == "当前名"
+    write_meta(claude_sessions, os.getpid(), SID, name="改过的")
+    _poll(poller)
+    assert renames(fake) == ["改过的"]
+
+
+def test_rename_truncates_to_60(fake, claude_sessions, clock):
+    bind_auto(synced="rw-1")
+    write_meta(claude_sessions, os.getpid(), SID, name="名" * 70)
+    _poll(listener._Poller(60))
+    assert renames(fake) == ["名" * 60]
+    b = state.load_binding(SID)
+    assert b.chat_name == "名" * 60 and b.synced_name == "名" * 70
+
+
+def test_rename_failure_cooldown_and_single_notice(
+    fake, claude_sessions, clock, monkeypatch, lark_home
+):
+    monkeypatch.setenv("FAKE_LARK_UPDATE_FAIL", "1")
+    bind_auto(synced="rw-1")
+    write_meta(claude_sessions, os.getpid(), SID, name="名1")
+    poller = listener._Poller(60)
+
+    def notices():
+        return [t for t in sent_texts(fake()) if t == listener.RENAME_FAILED]
+
+    clock[0] = 0
+    _poll(poller)
+    assert renames(fake) == ["名1"] and len(notices()) == 1
+    clock[0] = 30
+    _poll(poller)
+    assert len(renames(fake)) == 1
+    clock[0] = 61
+    _poll(poller)
+    assert len(renames(fake)) == 2 and len(notices()) == 1
+    write_meta(claude_sessions, os.getpid(), SID, name="名2")
+    clock[0] = 122
+    _poll(poller)
+    assert renames(fake)[-1] == "名2" and len(notices()) == 1
+    assert "+chat-update" in (lark_home / "errors.log").read_text()
+    assert state.load_binding(SID).synced_name == "rw-1"
+    assert listener.RENAME_FAILED == (
+        "改群名失败，可能缺少 im:chat:update 权限，详见 errors.log"
+    )
+
+
+def test_rename_recovers_after_failure(fake, claude_sessions, clock, monkeypatch):
+    monkeypatch.setenv("FAKE_LARK_UPDATE_FAIL", "1")
+    bind_auto(synced="rw-1")
+    write_meta(claude_sessions, os.getpid(), SID, name="名1")
+    poller = listener._Poller(60)
+    _poll(poller)
+    monkeypatch.delenv("FAKE_LARK_UPDATE_FAIL")
+    clock[0] = 61
+    _poll(poller)
+    assert state.load_binding(SID).synced_name == "名1"
+    assert SID not in poller.rename_retry_at
+
+
+def test_rename_writeback_keeps_new_claude_pid(
+    fake, claude_sessions, clock, monkeypatch
+):
+    bind_auto(synced="rw-1")
+    write_meta(claude_sessions, os.getpid(), SID, name="新名字")
+    real = feishu.update_chat_name
+
+    def racing(chat_id, name, timeout):
+        state.update_binding(SID, lambda b: setattr(b, "claude_pid", 99999))
+        real(chat_id, name, timeout)
+
+    monkeypatch.setattr(feishu, "update_chat_name", racing)
+    _poll(listener._Poller(60))
+    b = state.load_binding(SID)
+    assert b.claude_pid == 99999 and b.synced_name == "新名字"
+
+
+def test_rename_writeback_dropped_when_chat_changed(
+    fake, claude_sessions, clock, monkeypatch
+):
+    bind_auto(synced="rw-1")
+    write_meta(claude_sessions, os.getpid(), SID, name="新名字")
+    real = feishu.update_chat_name
+
+    def racing(chat_id, name, timeout):
+        state.update_binding(SID, lambda b: setattr(b, "chat_id", "oc_other"))
+        real(chat_id, name, timeout)
+
+    monkeypatch.setattr(feishu, "update_chat_name", racing)
+    _poll(listener._Poller(60))
+    b = state.load_binding(SID)
+    assert b.chat_id == "oc_other" and b.synced_name == "rw-1"
+    assert b.chat_name == "rw-1"
+
+
+def test_rename_runs_after_message_poll(fake, claude_sessions, clock):
+    bind_auto(synced="rw-1")
+    write_meta(claude_sessions, os.getpid(), SID, name="新名字")
+    _poll(listener._Poller(60))
+    heads = [" ".join(c[:3]) for c in fake()]
+    get = heads.index("api GET /open-apis/im/v1/messages")
+    upd = next(i for i, h in enumerate(heads) if h.startswith("im +chat-update"))
+    assert get < upd
+
+
+def test_rename_skipped_when_stopped(fake, claude_sessions, clock):
+    bind_auto(synced="rw-1")
+    write_meta(claude_sessions, os.getpid(), SID, name="新名字")
+    stop = threading.Event()
+    stop.set()
+    listener._Poller(60).poll_once(stop)
+    assert renames(fake) == []

@@ -20,6 +20,14 @@ def session_dir(session_id: str) -> Path:
     return home() / "sessions" / session_id
 
 
+def claude_sessions_dir() -> Path:
+    """Claude Code 的会话元数据目录（<pid>.json）。"""
+    env = os.environ.get("CLAUDE_LARK_CLAUDE_SESSIONS")
+    if env:
+        return Path(env)
+    return Path.home() / ".claude" / "sessions"
+
+
 def config_file() -> Path:
     return home() / "config.json"
 
