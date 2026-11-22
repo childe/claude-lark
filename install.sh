@@ -49,24 +49,15 @@ print(settings.apply("merge"))
 
 # 5. 记录 owner（当前登录的飞书用户；只有这个人发的消息会被处理）
 python3 -c '
-import json, sys
-from lark_bridge import feishu, paths
+import sys
+from lark_bridge import config, feishu, paths
 try:
     oid = feishu.owner_open_id()
 except Exception as e:
     print("❌ 读不到当前登录用户（%s），请先运行 lark-cli auth login 再重新安装" % e, file=sys.stderr)
     sys.exit(1)
-cfg_path = paths.config_file()
-cfg_path.parent.mkdir(parents=True, exist_ok=True)
-try:
-    cfg = json.loads(cfg_path.read_text())
-    if not isinstance(cfg, dict):
-        cfg = {}
-except (OSError, ValueError):
-    cfg = {}
-cfg["owner_open_id"] = oid
-cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
-print("已写入 %s" % cfg_path)
+config.set_owner(oid)
+print("已写入 %s" % paths.config_file())
 '
 
 # 6. 自检（失败不让安装失败：doctor 会打印怎么修）

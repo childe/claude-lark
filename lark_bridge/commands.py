@@ -1,11 +1,10 @@
 """/lark 命令：开启、关闭、查看桥接。返回给 Claude 看的文本，首行是协议标记。"""
 
-import json
 import os
 import re
 import time
 
-from . import feishu, listener, paths, procs, state
+from . import config, feishu, listener, procs, state
 
 NEED_NAME = "NEED_NAME"
 HINT = "在群里发消息就能继续这个会话，终端也照常可用；/lark off 停止同步"
@@ -38,6 +37,8 @@ def on(sid: str, name: str) -> str:
 
 
 NO_OWNER = "未找到 owner 配置，请重新运行 install.sh"
+AUTO_ON_TEXT = "已开启自动连接：新会话发出第一句后自动建群并开启桥接"
+AUTO_OFF_TEXT = "已关闭自动连接"
 
 
 def _owner():
@@ -45,10 +46,7 @@ def _owner():
 
     不退回 auth status：监听进程只认 config.json，没有 owner 时它会丢弃所有消息，
     桥接开了也收不到东西。"""
-    try:
-        oid = json.loads(paths.config_file().read_text()).get("owner_open_id")
-    except (OSError, ValueError, AttributeError):
-        oid = None
+    oid = config.load().get("owner_open_id")
     return oid if isinstance(oid, str) and oid else None
 
 
@@ -66,6 +64,12 @@ def _slash(sid: str, args: str) -> str:
         return _off(sid)
     if args == "status":
         return _status(sid)
+    if args == "auto on":
+        config.set_auto_on(True)
+        return _result(AUTO_ON_TEXT)
+    if args == "auto off":
+        config.set_auto_on(False)
+        return _result(AUTO_OFF_TEXT)
     owner = _owner()
     if owner is None:
         return _result(NO_OWNER)
@@ -110,12 +114,13 @@ def _off(sid: str) -> str:
 
 
 def _status(sid: str) -> str:
+    auto = f"；自动连接{'已开启' if config.auto_on() else '未开启'}"
     b = state.load_binding(sid)
     if not b:
-        return _result("当前会话未绑定群，桥接未开启")
+        return _result("当前会话未绑定群，桥接未开启" + auto)
     on_ = "已开启" if state.is_enabled(sid) else "未开启"
     alive = "存活" if listener.is_running() else "未运行"
-    return _result(f"绑定群 {b.chat_name}，桥接{on_}，监听进程{alive}")
+    return _result(f"绑定群 {b.chat_name}，桥接{on_}，监听进程{alive}" + auto)
 
 
 def _occupied(b, sid) -> str:

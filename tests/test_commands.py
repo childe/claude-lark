@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from lark_bridge import commands, listener, paths, state
+from lark_bridge import commands, config, listener, paths, state
 
 SID = "00000000-0000-0000-0000-0000000000c1"
 SID2 = "00000000-0000-0000-0000-0000000000c2"
@@ -183,10 +183,12 @@ def test_slash_status(fake, monkeypatch):
     bind(SID, name="旧群", enable=True)
     monkeypatch.setattr(listener, "is_running", lambda: True)
     out = commands.slash(SID, "status")
-    assert out == "RESULT: 绑定群 旧群，桥接已开启，监听进程存活"
+    assert out == "RESULT: 绑定群 旧群，桥接已开启，监听进程存活；自动连接未开启"
     state.set_enabled(SID, False)
     monkeypatch.setattr(listener, "is_running", lambda: False)
-    assert commands.slash(SID, "status").endswith("桥接未开启，监听进程未运行")
+    assert commands.slash(SID, "status").endswith(
+        "桥接未开启，监听进程未运行；自动连接未开启"
+    )
 
 
 def test_on_creates_group_and_truncates_name_to_60(fake):
@@ -373,3 +375,36 @@ def test_enable_fails_loudly_when_claude_start_time_unreadable(fake, monkeypatch
     assert "启动时间" in out
     assert not state.is_enabled(SID)
     assert fake.started == []
+
+
+# ---------------- auto on/off
+
+
+def test_slash_auto_on_off(fake):
+    assert commands.slash(SID, "auto on") == f"RESULT: {commands.AUTO_ON_TEXT}"
+    assert config.auto_on() is True
+    assert commands.slash(SID, "auto off") == f"RESULT: {commands.AUTO_OFF_TEXT}"
+    assert config.auto_on() is False
+    assert fake() == []
+
+
+def test_auto_args_must_match_whole_string(fake):
+    assert commands.slash(SID, "  auto on ") == f"RESULT: {commands.AUTO_ON_TEXT}"
+    commands.slash(SID, "auto off")
+    commands.slash(SID, "auto onx")  # 按群名建群
+    create = [c for c in fake() if c[:2] == ["im", "+chat-create"]]
+    assert arg(create[0], "--name") == "auto onx"
+    assert config.auto_on() is False
+
+
+def test_slash_auto_alone_is_group_name(fake):
+    commands.slash(SID, "auto")
+    create = [c for c in fake() if c[:2] == ["im", "+chat-create"]]
+    assert arg(create[0], "--name") == "auto"
+    assert config.auto_on() is False
+
+
+def test_slash_status_shows_auto(fake):
+    assert commands.slash(SID, "status").endswith("；自动连接未开启")
+    config.set_auto_on(True)
+    assert commands.slash(SID, "status").endswith("；自动连接已开启")
