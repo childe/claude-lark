@@ -183,6 +183,11 @@ def _wait(sid, data, binding, start, now, sleep) -> str:
 
     终端输入的镜像也只在这里做（prompt hook 只改计数器）：每次输入只有一个
     wait 进程，镜像恰好一次，不需要和 prompt hook 判断谁先谁后。"""
+    return _mirror_and_wait(sid, data, start, now, sleep)
+
+
+def _mirror_and_wait(sid, data, start, now, sleep) -> str:
+    """已开启时处理本次输入：镜像（跳过特殊 prompt），再成为等待进程。"""
     _mirror_input(sid, data.get("prompt"))
     return _become_waiter(sid, start, now, sleep)
 
@@ -190,17 +195,15 @@ def _wait(sid, data, binding, start, now, sleep) -> str:
 def _auto_wait(sid, data, start, now, sleep) -> str:
     """未开启时的 wait hook：auto_on 下第一句之后自动建群（或重试开启）。
 
-    开启了就补做这一句的计数器更新与镜像（prompt hook 先跑时看到未开启，什么都没做），
-    再成为等待进程。"""
+    之后只看当前是否已开启，不看是不是本次调用开启的：建群或 resume 接回可能由另一条
+    路径在本次等 connect_lock 期间完成。已开启就补做这一句的计数器更新（prompt hook
+    先跑时看到未开启，什么都没做），再走与 _wait 相同的镜像与等待。"""
     prompt = data.get("prompt")
-    r = commands.auto_connect(sid, "prompt", prompt if isinstance(prompt, str) else "")
-    if r:
-        state.set_counter(sid, "busy", 1)
-        state.set_counter(sid, "keepalive_pending", 0)
-        _mirror_input(sid, prompt)
-    if state.is_enabled(sid):
-        return _become_waiter(sid, start, now, sleep)
-    return ""
+    commands.auto_connect(sid, "prompt", prompt if isinstance(prompt, str) else "")
+    if not state.is_enabled(sid):
+        return ""
+    _count_input(sid, prompt)
+    return _mirror_and_wait(sid, data, start, now, sleep)
 
 
 def _session_resume(sid, data, start, now, sleep) -> str:
@@ -260,15 +263,19 @@ _NOTIFICATION_PREFIX = "<task-notification>"
 
 
 def _prompt(sid, data, binding, start, now, sleep) -> str:
-    prompt = data.get("prompt")
+    _count_input(sid, data.get("prompt"))
+    # 镜像由 wait hook 做（见 _wait）
+    return ""
+
+
+def _count_input(sid, prompt) -> None:
+    """终端输入的计数器更新。"""
     if isinstance(prompt, str) and prompt.lstrip().startswith(_NOTIFICATION_PREFIX):
         # 后台通知（飞书消息投递、保活等），不是终端输入：不镜像，保活标记也不动
-        return ""
+        return
     state.set_counter(sid, "busy", 1)
     # 用户在终端发了新 prompt，下一次 Stop 的回复是真回复，不能当保活回复跳过
     state.set_counter(sid, "keepalive_pending", 0)
-    # 镜像由 wait hook 做（见 _wait）
-    return ""
 
 
 def _mirror_input(sid, prompt) -> None:

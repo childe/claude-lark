@@ -205,3 +205,56 @@ def test_session_start_without_claude_pid_disables(auto, monkeypatch):
     monkeypatch.setattr(commands.procs, "find_claude_ancestor", lambda: None)
     run("session-start", resume_input())
     assert not state.is_enabled(SID)
+
+
+def connected_first_by(monkeypatch, other):
+    """本次 wait 的 auto_connect 拿到 connect_lock 之前，另一条连接路径（other）已完成开启。"""
+    real = commands.auto_connect
+
+    def connect(sid, source, prompt=""):
+        assert other(real, sid) in ("created", "enabled")
+        return real(sid, source, prompt)
+
+    monkeypatch.setattr(commands, "auto_connect", connect)
+
+
+def test_input_mirrored_when_concurrent_create_connects_first(
+    auto, mirrors, monkeypatch
+):
+    """建群尚未完成时再次输入：本次 auto_connect 返回空，但已开启，本次输入仍镜像一次。"""
+    connected_first_by(monkeypatch, lambda real, sid: real(sid, "prompt", "修 bug"))
+    state.set_counter(SID, "keepalive_pending", 1)
+    clock = Clock()
+    hooks.run("prompt", prompt_input("再来一句"), clock.now, clock.sleep)  # 未开启
+    out = hooks.run("wait", prompt_input("再来一句"), clock.now, clock.sleep)
+    assert state.is_enabled(SID) and len(creates(auto)) == 1
+    assert mirrors == ["再来一句"]
+    assert state.get_counter(SID, "busy") == 1
+    assert state.get_counter(SID, "keepalive_pending") == 0
+    assert out == "" and clock.sleeps > 0  # 成为了等待进程
+
+
+def test_input_mirrored_when_resume_connects_first(auto, mirrors, monkeypatch):
+    """resume 接回期间立即输入：本次输入镜像一次，不建群。"""
+    saved_binding()
+    connected_first_by(monkeypatch, lambda real, sid: real(sid, "resume"))
+    clock = Clock()
+    hooks.run("prompt", prompt_input("接着干"), clock.now, clock.sleep)  # 未开启
+    hooks.run("wait", prompt_input("接着干"), clock.now, clock.sleep)
+    assert state.is_enabled(SID) and creates(auto) == []
+    assert mirrors == ["接着干"]
+    assert state.get_counter(SID, "busy") == 1
+
+
+def test_notification_not_mirrored_when_other_path_connects_first(
+    auto, mirrors, monkeypatch
+):
+    """另一条路径先开启时，后台通知仍按特殊 prompt 处理：不镜像，计数器不动。"""
+    saved_binding()
+    connected_first_by(monkeypatch, lambda real, sid: real(sid, "resume"))
+    state.set_counter(SID, "keepalive_pending", 1)
+    clock = Clock()
+    hooks.run("wait", prompt_input("<task-notification>x"), clock.now, clock.sleep)
+    assert state.is_enabled(SID) and mirrors == []
+    assert state.get_counter(SID, "busy") == 0
+    assert state.get_counter(SID, "keepalive_pending") == 1
