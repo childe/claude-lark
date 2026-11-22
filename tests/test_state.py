@@ -1,8 +1,10 @@
+import json
 import os
+import threading
 
 import pytest
 
-from lark_bridge import procs, state
+from lark_bridge import paths, procs, state
 
 SID = "00000000-0000-0000-0000-000000000001"
 SID2 = "00000000-0000-0000-0000-000000000002"
@@ -199,7 +201,7 @@ def test_start_time_of_dead_pid_is_empty():
 def test_start_time_uses_proc_ticks_immune_to_clock_changes(lark_home, monkeypatch):
     """调系统时间会让 ps lstart 整秒漂移；/proc 的启动滴答数不受影响。"""
     st = procs.start_time(os.getpid())
-    assert st.startswith("ticks:") and st[len("ticks:"):].isdigit()
+    assert st.startswith("ticks:") and st[len("ticks:") :].isdigit()
     state.set_enabled(SID, True, os.getpid())
     monkeypatch.setattr(procs, "lstart", lambda pid: "Thu Jan  1 00:00:01 1970")
     assert state.is_enabled(SID)
@@ -221,3 +223,142 @@ def test_enabled_false_when_proc_ticks_differ(lark_home):
     assert not f.exists()
     log = (lark_home / "errors.log").read_text()
     assert f"session {SID} disabled: claude pid {os.getpid()} start time changed" in log
+
+
+# ---------------- binding sync fields, locks, auto_pending
+
+
+def test_legacy_binding_defaults(lark_home):
+    p = paths.session_dir(SID) / "binding.json"
+    p.parent.mkdir(parents=True)
+    legacy = {
+        "session_id": SID,
+        "chat_id": "oc_x",
+        "chat_name": "群",
+        "cwd": "/w",
+        "claude_pid": 1,
+        "created_at": 0,
+    }
+    p.write_text(json.dumps(legacy))
+    b = state.load_binding(SID)
+    assert b.created_by_bridge is True and b.synced_name is None
+    p.write_text(json.dumps({**legacy, "chat_name": "oc_x"}))
+    assert state.load_binding(SID).created_by_bridge is False
+
+
+def test_new_fields_roundtrip(lark_home):
+    b = state.Binding(SID, "oc_x", "oc_x", "/w", 1, 0.0, True, "n")
+    state.save_binding(b)
+    assert state.load_binding(SID) == b
+
+
+def test_update_binding_rereads(lark_home):
+    state.save_binding(mk(pid=1))
+    stale = state.load_binding(SID)
+    state.update_binding(SID, lambda b: setattr(b, "claude_pid", 2))
+    state.update_binding(SID, lambda b: setattr(b, "synced_name", "n"))
+    b = state.load_binding(SID)
+    assert (b.claude_pid, b.synced_name) == (2, "n") and stale.claude_pid == 1
+
+
+def test_update_binding_missing_without_default(lark_home):
+    assert state.update_binding(SID, lambda b: None) is None
+    assert state.load_binding(SID) is None
+    assert (
+        state.update_binding(SID, lambda b: None, default=mk()).chat_id
+        == "oc_test_chat"
+    )
+    assert state.load_binding(SID).chat_id == "oc_test_chat"
+
+
+def test_disable_if_foreign_keeps_own(lark_home):
+    me = os.getpid()
+    state.set_enabled(SID, True, me)
+    assert state.disable_if_foreign(SID, me, procs.start_time(me)) is False
+    assert state.is_enabled(SID)
+
+
+def test_disable_if_foreign_removes_other(lark_home):
+    state.set_enabled(SID, True, os.getppid())
+    me = os.getpid()
+    assert state.disable_if_foreign(SID, me, procs.start_time(me)) is True
+    assert not (paths.session_dir(SID) / "enabled").exists()
+
+
+def test_disable_if_foreign_missing_file(lark_home):
+    me = os.getpid()
+    assert state.disable_if_foreign(SID, me, procs.start_time(me)) is False
+
+
+def test_disable_if_foreign_interleaved_with_enable(lark_home, monkeypatch):
+    """清理读到旧值后暂停；接回写入当前进程的值必须等清理结束。"""
+    me = os.getpid()
+    state.set_enabled(SID, True, os.getppid())  # 旧进程留下的
+    paused, go = threading.Event(), threading.Event()
+
+    def hook():
+        paused.set()
+        go.wait(5)
+
+    monkeypatch.setattr(state, "_after_foreign_read", hook)
+    t = threading.Thread(
+        target=state.disable_if_foreign, args=(SID, me, procs.start_time(me))
+    )
+    t.start()
+    assert paused.wait(5)
+    w = threading.Thread(target=state.set_enabled, args=(SID, True, me))
+    w.start()
+    w.join(0.3)
+    assert w.is_alive()  # 被 enabled.lock 挡住
+    go.set()
+    t.join(5)
+    w.join(5)
+    content = (paths.session_dir(SID) / "enabled").read_text()
+    assert content.split("\n")[0] == str(me) and state.is_enabled(SID)
+
+
+def test_is_enabled_stale_delete_spares_rewritten_file(lark_home, monkeypatch):
+    """判定失效后、删除之前文件被重写：不能删掉新内容。"""
+    f = paths.session_dir(SID) / "enabled"
+    f.parent.mkdir(parents=True)
+    f.write_text("999999\nticks:1")  # 已退出的旧进程
+    real = procs.pid_alive
+
+    def alive(pid):
+        r = real(pid)
+        if pid == 999999:
+            state.set_enabled(SID, True, os.getpid())
+        return r
+
+    monkeypatch.setattr(state.procs, "pid_alive", alive)
+    assert state.is_enabled(SID) is False
+    monkeypatch.setattr(state.procs, "pid_alive", real)
+    assert state.is_enabled(SID)
+
+
+def test_auto_pending_marker(lark_home):
+    assert not state.has_auto_pending(SID)
+    state.mark_auto_pending(SID)
+    assert state.has_auto_pending(SID)
+    state.clear_auto_pending(SID)
+    state.clear_auto_pending(SID)
+    assert not state.has_auto_pending(SID)
+
+
+def test_connect_lock_serializes(lark_home):
+    order = []
+    entered = threading.Event()
+
+    def holder():
+        with state.connect_lock(SID):
+            entered.set()
+            threading.Event().wait(0.2)
+            order.append("a")
+
+    t = threading.Thread(target=holder)
+    t.start()
+    assert entered.wait(5)
+    with state.connect_lock(SID):
+        order.append("b")
+    t.join(5)
+    assert order == ["a", "b"]

@@ -18,6 +18,15 @@ class Binding:
     cwd: str
     claude_pid: Optional[int]
     created_at: float
+    # 群是不是 claude-lark 自己建的（只改自己建的群的群名）。旧 binding 没有这个字段，
+    # 按 chat_name != chat_id 推断：/lark oc_xxx 绑定时群名记的就是 chat_id。
+    created_by_bridge: Optional[bool] = None
+    # 上次同步到群名的会话名；None 表示旧 binding，还没有基线
+    synced_name: Optional[str] = None
+
+    def __post_init__(self):
+        if self.created_by_bridge is None:
+            self.created_by_bridge = self.chat_name != self.chat_id
 
 
 def _atomic_write(path, data: str):
@@ -35,11 +44,103 @@ def load_binding(sid):
         return None
 
 
-def save_binding(b: Binding):
+def _write_binding(b: Binding):
     _atomic_write(
         paths.session_dir(b.session_id) / "binding.json",
         json.dumps(asdict(b), ensure_ascii=False),
     )
+
+
+def save_binding(b: Binding):
+    with _blocking_lock(b.session_id, "binding.lock"):
+        _write_binding(b)
+
+
+def update_binding(sid, fn, default: Optional[Binding] = None) -> Optional[Binding]:
+    """在 binding.lock 里重读 binding（读不到用 default），fn(b) 原地修改后写回。
+
+    两者都没有时返回 None 且不写。fn 里不能做网络调用。"""
+    with _blocking_lock(sid, "binding.lock"):
+        b = load_binding(sid) or default
+        if b is None:
+            return None
+        fn(b)
+        _write_binding(b)
+        return b
+
+
+@contextlib.contextmanager
+def _blocking_lock(sid, name):
+    """会话目录里的一把阻塞 flock。"""
+    p = paths.session_dir(sid) / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def connect_lock(sid):
+    """开启 / 建群 / 绑定 / 断开 的整段决定串行化（手动 /lark 与自动连接共用）。
+
+    锁序：connect.lock → binding.lock → enabled.lock。"""
+    return _blocking_lock(sid, "connect.lock")
+
+
+def _enabled_lock(sid):
+    """enabled 文件读改写的叶子锁，里面不做网络调用和子进程。"""
+    return _blocking_lock(sid, "enabled.lock")
+
+
+# 仅测试注入：disable_if_foreign 读完 enabled 之后、判断之前调用
+_after_foreign_read = None
+
+
+def _norm(content: str) -> str:
+    return " ".join(content.split())
+
+
+def disable_if_foreign(sid, pid: int, start_time: str) -> bool:
+    """enabled 记的不是 (pid, start_time) 这个进程就删掉并返回 True。
+
+    内容相同保留并返回 False；文件不存在返回 False。"""
+    f = paths.session_dir(sid) / "enabled"
+    with _enabled_lock(sid):
+        try:
+            content = f.read_text()
+        except OSError:
+            return False
+        if _after_foreign_read is not None:
+            _after_foreign_read()
+        if _norm(content) == _norm(f"{pid}\n{start_time}"):
+            return False
+        try:
+            f.unlink()
+        except OSError:
+            return False
+        return True
+
+
+def _auto_pending(sid):
+    return paths.session_dir(sid) / "auto_pending"
+
+
+def mark_auto_pending(sid):
+    """自动建群后、开启成功之前的标记：下一句只重试开启，不重复建群。"""
+    _atomic_write(_auto_pending(sid), "")
+
+
+def has_auto_pending(sid) -> bool:
+    return _auto_pending(sid).exists()
+
+
+def clear_auto_pending(sid):
+    try:
+        _auto_pending(sid).unlink()
+    except OSError:
+        pass
 
 
 def is_enabled(sid) -> bool:
@@ -50,9 +151,10 @@ def is_enabled(sid) -> bool:
     空文件（没有 pid）算开启。判定为失效时顺手删掉 enabled。"""
     f = paths.session_dir(sid) / "enabled"
     try:
-        content = f.read_text().strip()
+        raw = f.read_text()
     except OSError:
         return False
+    content = raw.strip()
     if not content:
         return True
     pid_s, _, start = content.partition("\n")
@@ -69,20 +171,21 @@ def is_enabled(sid) -> bool:
     )
     if alive:
         # 旧版本写的是 lstart 字符串，按原来的方式比，避免升级后误判断开
-        now = (
-            procs.start_time(pid)
-            if start.startswith("ticks:")
-            else procs.lstart(pid)
-        )
+        now = procs.start_time(pid) if start.startswith("ticks:") else procs.lstart(pid)
         # ps 偶尔取不到（进程刚好退出等）时无法否定，按 pid 存活判断
         alive = not now or now == start
         reason = f"claude pid {pid} start time changed: {start!r} -> {now!r}"
     if not alive:
-        try:
-            f.unlink()
-        except OSError:
-            pass
-        else:
+        removed = False
+        with _enabled_lock(sid):
+            # 判定期间可能被重新开启：内容仍是当初读到的才删
+            try:
+                if f.read_text() == raw:
+                    f.unlink()
+                    removed = True
+            except OSError:
+                pass
+        if removed:
             feishu.log_error(f"session {sid} disabled: {reason}")
     return alive
 
@@ -100,15 +203,20 @@ def set_enabled(sid, on: bool, claude_pid=None):
     is_enabled 会判定为未开启，调用方应检查）。"""
     f = paths.session_dir(sid) / "enabled"
     if on:
-        if claude_pid is None:
-            _atomic_write(f, "")
-        else:
-            _atomic_write(f, f"{claude_pid}\n{procs.start_time(claude_pid)}")
+        # 启动时间要跑子进程，在拿锁之前算好
+        content = (
+            ""
+            if claude_pid is None
+            else f"{claude_pid}\n{procs.start_time(claude_pid)}"
+        )
+        with _enabled_lock(sid):
+            _atomic_write(f, content)
     else:
-        try:
-            f.unlink()
-        except OSError:
-            pass
+        with _enabled_lock(sid):
+            try:
+                f.unlink()
+            except OSError:
+                pass
 
 
 def all_bindings():
@@ -246,17 +354,9 @@ def peek_inbox(sid, since: int = 0):
     return msgs, offset
 
 
-@contextlib.contextmanager
 def _consumed_lock(sid):
     """游标与 consumed.txt 的读-改-写都在这把锁里做（持有时间很短）。"""
-    p = paths.session_dir(sid) / "consumed.lock"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "a+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+    return _blocking_lock(sid, "consumed.lock")
 
 
 def _try_lock(sid, name):
