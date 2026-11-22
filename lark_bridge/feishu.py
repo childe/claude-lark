@@ -172,6 +172,23 @@ def create_chat(name: str, owner_open_id: str) -> str:
     return chat_id
 
 
+def update_chat_name(chat_id: str, name: str, timeout: float) -> None:
+    """改群名（截到 60 字符）。失败抛 FeishuError。"""
+    _run(
+        [
+            "im",
+            "+chat-update",
+            "--as",
+            "bot",
+            "--chat-id",
+            chat_id,
+            "--name",
+            name[:60],
+        ],
+        timeout=timeout,
+    )
+
+
 def owner_open_id() -> str:
     data = _json(_run(["auth", "status"]))
     oid = ((data.get("identities") or {}).get("user") or {}).get("openId")
