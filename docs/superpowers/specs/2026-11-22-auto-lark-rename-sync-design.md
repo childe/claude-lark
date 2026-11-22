@@ -90,7 +90,13 @@
 | 有 binding，且会话目录里有 `auto_pending` 标记 | 群已建出、上次开启失败：复用这个 binding 只重试 `_enable`，**不再建群** |
 | 有 binding，没有 `auto_pending` 标记 | 什么都不做（手动绑定过、或用户 `/lark off` 过） |
 
-`auto_pending` 标记：自动建群在 `create_chat` 成功、落 binding 的**同时**写入（先写标记再写 binding，两者都在锁内）；`_enable` 成功后删除。手动 `/lark`、`/lark off` 不写这个标记，所以 off 过的会话不会被自动重新开启（反目标第 3 条）。
+`auto_pending` 标记：自动建群在 `create_chat` 成功、落 binding 的**同时**写入（先写标记再写 binding，两者都在锁内）。以下三处删除它：
+
+- 自动连接里 `_enable` 成功后；
+- 手动 `/lark`（建群或绑定已有群）开启成功后——用户已经手动接管；
+- `/lark off`：`_off()` 改为在同一把 `connect.lock` 里先删除 `auto_pending`、再断开 enabled。
+
+手动 `/lark`、`/lark off` 都不写这个标记。这样"自动开启失败留下标记 → 用户 `/lark off` → 下一句"命中表格第三行"什么都不做"，off 过的会话不会被自动重新开启（反目标第 3 条）；`_off()` 持 `connect.lock` 也保证它不会与正在进行的自动连接交错（自动连接先完成，off 再断开；或 off 先完成，自动连接锁内重读时已无标记）。
 
 建群流程：
 
@@ -104,7 +110,7 @@
 - **建群失败**（`create_chat` 报错、未登录、没有 owner、找不到 claude 进程）：没有 binding，下一句按"没有 binding"重新建群。
 - **群已建出、开启失败**（`_enable` 里读不到 claude 进程启动时间、拉起监听进程出错等）：binding 与 `auto_pending` 都在，下一句只重试开启，不重新建群。
 
-测试要覆盖：开启失败后下一句只调用一次 `+chat-create`（即不重复建群）且最终开启；`/lark off` 之后的下一句不自动开启。
+测试要覆盖：开启失败后下一句只调用一次 `+chat-create`（即不重复建群）且最终开启；`/lark off` 之后的下一句不自动开启；**自动开启失败（留下 `auto_pending`）→ `/lark off` → 下一句**，不自动开启且 `auto_pending` 已删除；自动开启失败后手动 `/lark` 成功，`auto_pending` 已删除。
 
 已知限制：如果第一轮在群建好之前就结束了，这一轮的最终回复不会发到群里；后续回合正常。
 
@@ -113,11 +119,15 @@
 SessionStart 拆成两个 hook 条目，清理与接回分开：
 
 1. **现有的同步 `session-start` 条目保留**（不改成 asyncRewake，超时仍为 10 秒）：`source` 为 `startup` / `resume` / `clear` 时断开残留的 enabled 状态；`compact` 不断开。改动一处：**只断开不属于当前 claude 进程的 enabled**——enabled 文件里记的 pid 与启动时间等于当前 claude 祖先进程的，不删。找不到 claude 祖先进程时退回现有的无条件断开。
+
+   "读 enabled → 判断 → 删除"必须是原子的，否则会出现：清理读到旧进程的 enabled、判断该删 → 并行的 `session-resume` 调用 `_enable` 写入当前进程的 enabled → 清理按路径删除，把新连接关掉。因此新增 `state.disable_if_foreign(sid, pid, start_time)`：在会话目录的 `enabled.lock`（阻塞 flock）里重读 enabled、判断、删除。`set_enabled` 的写入和删除也都在 `enabled.lock` 里完成。两者互斥后只剩两种顺序：清理先完成（删掉旧值）再由接回写入新值；或接回先写入新值，清理锁内重读到当前进程的值而不删。
+
+   这里用只包住 enabled 文件读写的 `enabled.lock`，而不用 `connect.lock`：`connect.lock` 在自动建群时包住 `create_chat` 等网络调用，同步的 `session-start` 条目只有 10 秒超时、且会阻塞终端启动，不能等它。`enabled.lock` 内没有网络调用和子进程，持锁时间是毫秒级。
 2. **新增 asyncRewake 的 `session-resume` 条目**（后台运行，超时 86400）：`source == "resume"`、`auto_on` 为真、会话是交互式（同 5.2 前置条件第 2 条）、该 session 有 binding → 调用 `auto_connect(source="resume")`：锁内重读到 binding 就调用 `_enable` 接回那个群，不看 `auto_pending`（"绑过就接回"）；没有 binding 则什么都不做，留给首句（resume 路径从不建群；群被别的会话占用时不接回，记日志），然后成为等待进程。其他情况立刻返回。
 
 为什么这样拆：两个 SessionStart 条目可能并行执行，后台进程的调度时间也不确定。如果清理在后台、且无条件删除，它可能晚于接回、首句自动开启或手动 `/lark` 执行，把刚开启的桥接关掉。条件断开之后，当前进程刚写下的 enabled（pid 与启动时间都是当前进程的）不会被清理删掉；残留的 enabled 一定来自别的进程（同一 session 在另一个终端里的旧进程，或已退出的进程），照旧断开。同一进程内切走会话时 SessionEnd 已经断开，不依赖 SessionStart 清理。
 
-测试要覆盖：先开启（写入当前进程的 pid 与启动时间）再执行清理，enabled 仍在；enabled 记的是别的 pid 时，清理会删掉它。
+测试要覆盖：先开启（写入当前进程的 pid 与启动时间）再执行清理，enabled 仍在；enabled 记的是别的 pid 时，清理会删掉它；**交错**：清理读到旧值后暂停（测试里用钩子注入），接回写入当前进程的值，清理继续——最终 enabled 仍是当前进程的值（`enabled.lock` 使接回的写入等到清理结束后才发生）。
 
 `/lark off` 保留 binding，所以 off 过的会话不会被首句自动建群；之后 resume 时会被接回（用户选择的"绑过就接回"）。
 
@@ -132,7 +142,7 @@ Binding 新增两个字段（对旧 binding 文件向后兼容，缺字段时有
 
 **基线规则**：只有会话名与 `synced_name` 不同时才改群名。这样手动 `/lark` 时 Claude 总结的群名不会被当时的自动名覆盖；首句建群后的第一次 `/rename` 会生效。旧 binding 没有 `synced_name` 时，第一次观测只记录基线、不改名。
 
-监听进程每轮**先完成全部群的消息轮询，再**做改名检查（改名不排在消息拉取前面，不推迟消息接收）。对 enabled 的 binding：
+监听进程每轮**先完成全部群的消息轮询，再**做改名检查。这是串行方案的取舍：改名不会推迟本轮的消息拉取，但会推迟**下一轮**拉取；最坏延迟约为"本轮需要改名的群数 × 10 秒"（每次改名的超时）。只有会话名刚变化、或失败后 60 秒冷却到期的群才会调用改名，平常这一项为 0。不另起改名线程，是为了不增加调度与 binding 写回的协调。对 enabled 的 binding：
 
 1. 跳过 `created_by_bridge` 为假的 binding。
 2. 读 `~/.claude/sessions/<binding.claude_pid>.json`；文件不存在、解析失败、`sessionId` 不等于 binding 的 session → 跳过。
@@ -158,5 +168,5 @@ Binding 新增两个字段（对旧 binding 文件向后兼容，缺字段时有
 ## 6. 留给实现者的判断
 
 - 改名重试计时的具体存放位置（会话目录或内存）。
-- `connect.lock` 与 `binding.lock` 的获取顺序固定为先 `connect.lock` 后 `binding.lock`，避免死锁；两把锁都不跨越等待飞书消息的阶段。
+- 锁的获取顺序固定为 `connect.lock` → `binding.lock` → `enabled.lock`，避免死锁；`enabled.lock` 是叶子锁，持有时不再取其他锁。三把锁都不跨越等待飞书消息的阶段。
 - 测试沿用现有 `tests/fake_lark_cli.py` 的方式，给 `+chat-update` 加假实现；会话元数据文件的路径通过环境变量可替换，方便测试隔离。
