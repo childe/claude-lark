@@ -31,6 +31,8 @@
 3. 升级前留下的旧 binding 文件（没有新字段）：照常加载，`created_by_bridge` 按 `chat_name != chat_id` 推断，第一次观测只记基线不改名（Task 3 `test_legacy_binding_defaults`、Task 6 `test_rename_legacy_binding_records_baseline_only`）。
 4. `/lark auto`、`/lark auto onx`、`/lark  auto on `（首尾空白）：前两个按群名处理，最后一个去空白后是开关命令（Task 1 `test_auto_args_must_match_whole_string`）。
 5. 同一轮里连续两次 `/rename`、或改名接口持续失败：只同步最新的名字；失败 60 秒内不重试、群里只提示一次（Task 6 `test_rename_failure_cooldown_and_single_notice`）。
+6. 自动开启时拉起监听进程失败：不留 enabled、保留 `auto_pending`，下一句只重试开启（Task 4 `test_auto_connect_retries_after_listener_spawn_failure`、Task 5 `test_wait_hook_recovers_after_listener_spawn_failure`）。
+7. `prompt` 与 `wait` 两个 hook 任意先后、交错：首句恰好镜像一次（Task 5 `test_first_prompt_mirrored_once_*`）。
 
 ---
 
@@ -205,6 +207,10 @@ git commit -m "feat: read Claude Code session metadata"
   - `state.disable_if_foreign(sid, pid: int, start_time: str) -> bool`：`enabled.lock` 内重读 enabled；内容等于 `f"{pid}\n{start_time}"`（空白归一后比较）就保留并返回 `False`；否则删除并返回 `True`（文件不存在返回 `False`）。读完之后、判断之前调用模块级钩子 `state._after_foreign_read`（默认 `None`，仅测试注入）。
   - `is_enabled()` 判定失效后的删除改为：`enabled.lock` 内重读，内容仍等于当初读到的才删。
   - `state.mark_auto_pending(sid)`、`state.has_auto_pending(sid) -> bool`、`state.clear_auto_pending(sid)`：会话目录里的 `auto_pending` 文件，`clear` 对不存在的文件不报错。
+  - 首句镜像认领（保证首句恰好镜像一次，不依赖 `prompt` 与 `wait` 两个 hook 的执行顺序）：
+    - `state.write_first_mirror(sid, text)`：原子写会话目录的 `first_mirror` 文件，内容为 `text`。
+    - `state.claim_first_mirror(sid, text) -> Optional[bool]`：文件不存在或内容不等于 `text` 返回 `None`（没有待认领的首句）；内容相等时 `os.unlink`，成功返回 `True`（本调用方负责镜像），`FileNotFoundError` 返回 `False`（另一方已认领）。`unlink` 是原子的，两方并发认领只有一方得到 `True`。
+    - `state.drop_first_mirror(sid)`：删除，对不存在的文件不报错。
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -266,7 +272,28 @@ def test_auto_pending_marker(lark_home):
     state.mark_auto_pending(SID); assert state.has_auto_pending(SID)
     state.clear_auto_pending(SID); state.clear_auto_pending(SID)
     assert not state.has_auto_pending(SID)
+
+def test_first_mirror_claim(lark_home):
+    assert state.claim_first_mirror(SID, "a") is None           # 没有标记
+    state.write_first_mirror(SID, "a")
+    assert state.claim_first_mirror(SID, "b") is None           # 内容不同
+    assert state.claim_first_mirror(SID, "a") is True
+    assert state.claim_first_mirror(SID, "a") is None           # 已认领，文件已删
+    state.drop_first_mirror(SID)
+
+def test_first_mirror_claim_race(lark_home, monkeypatch):
+    """两方都读到相同内容后，只有先 unlink 的一方得到 True。"""
+    state.write_first_mirror(SID, "a")
+    real_unlink = os.unlink
+    def unlink_twice(p, *a, **k):
+        real_unlink(p)
+        monkeypatch.setattr(os, "unlink", real_unlink)
+        assert state.claim_first_mirror(SID, "a") is None       # 对方读时文件已没了
+    monkeypatch.setattr(os, "unlink", unlink_twice)
+    assert state.claim_first_mirror(SID, "a") is True
 ```
+
+（竞态的"都读到、后 unlink 失败"分支另用 patch `os.unlink` 抛 `FileNotFoundError` 断言返回 `False`。）
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -286,7 +313,7 @@ Expected: 全部 PASS
 
 ```bash
 git add lark_bridge/state.py tests/test_state.py
-git commit -m "feat: binding sync fields, connect/binding/enabled locks, auto_pending marker"
+git commit -m "feat: binding sync fields, connect/binding/enabled locks, auto_pending and first_mirror markers"
 ```
 
 ---
@@ -294,18 +321,21 @@ git commit -m "feat: binding sync fields, connect/binding/enabled locks, auto_pe
 ### Task 4: `commands.auto_connect` 与手动路径加锁
 
 **Files:**
-- Modify: `lark_bridge/commands.py`
-- Test: `tests/test_commands.py`
+- Modify: `lark_bridge/commands.py`、`lark_bridge/listener.py`（`ensure_running` 返回值）
+- Test: `tests/test_commands.py`、`tests/test_listener.py`
 
 **Interfaces:**
-- Consumes: `config.auto_on()`、`meta.is_interactive()`、`meta.session_name()`（Task 1、2）；`state.connect_lock`、`update_binding`、`mark_auto_pending`、`has_auto_pending`、`clear_auto_pending`（Task 3）。
+- Consumes: `config.auto_on()`、`meta.is_interactive()`、`meta.session_name()`（Task 1、2）；`state.connect_lock`、`update_binding`、`mark_auto_pending`、`has_auto_pending`、`clear_auto_pending`、`write_first_mirror`、`drop_first_mirror`（Task 3）。
 - Produces:
+  - `listener.ensure_running() -> bool`：监听进程已在跑（`_lock_held_by_other()` 为真）或本次 `Popen` 成功返回 `True`；捕获到异常时照旧 `log_exception` 并返回 `False`。仍然不抛出。
+  - `_enable` 在 `set_enabled` 且 `is_enabled` 通过之后调用 `listener.ensure_running()`；返回 `False` 时 `state.set_enabled(sid, False)`、`log_error`，并返回 `_result("拉起监听进程失败，未开启桥接，详见 errors.log")`。这样开启失败时 enabled 不留下，`auto_pending` 不被清除，下一句的 `wait` hook 仍走未开启分支（`_auto_wait`）重试。
   - `commands.AUTO_NAME_MAX = 20`
   - `commands.auto_name(prompt: str, session_name: str, cwd: str) -> str`：按 Global Constraints 的群名规则。
   - `commands.auto_connect(sid: str, source: str, prompt: str = "") -> str`：返回 `"created"`（本次建群并开启）、`"enabled"`（复用已有 binding 并开启）或 `""`（没做或失败）。`source` 取 `"prompt"` 或 `"resume"`。自身不抛出，异常走 `feishu.log_exception("commands.auto_connect")`。
   - `_create_and_enable(sid, name, owner, pid, auto=False)`：binding 写入 `created_by_bridge=True`、`synced_name=meta.session_name(pid, sid)`；`auto=True` 时**先** `mark_auto_pending` 再落 binding（都在调用方持有的 `connect.lock` 内）。
   - `_bind_existing` 写入 `created_by_bridge=False`、`synced_name=meta.session_name(pid, sid)`。
-  - `_enable` 写 `claude_pid` / `cwd` 改用 `state.update_binding(sid, fn, default=b)`；开启成功（`state.is_enabled(sid)` 为真）后调用 `state.clear_auto_pending(sid)`。
+  - `_enable` 写 `claude_pid` / `cwd` 改用 `state.update_binding(sid, fn, default=b)`；开启成功（`state.is_enabled(sid)` 为真**且** `listener.ensure_running()` 返回 `True`）后调用 `state.clear_auto_pending(sid)`。
+  - `auto_connect` 在 `source == "prompt"` 的"建群并开启"与"只重试开启"两条路径上，于锁内、调用 `_enable` **之前**执行 `state.write_first_mirror(sid, prompt)`；开启失败（返回 `""`）时 `state.drop_first_mirror(sid)`。resume 路径不写。
   - `_slash` 与 `_on` 的 "读 binding → 决定 → 建群/绑定/开启" 整段放进 `state.connect_lock(sid)`。
   - `_off` 在 `connect_lock` 内先 `clear_auto_pending`，再读 binding、断开。
 
@@ -353,6 +383,27 @@ def test_auto_connect_retries_enable_without_recreating(auto, monkeypatch):
     assert commands.auto_connect(SID, "prompt", "b") == "enabled"
     assert len([c for c in auto() if c[:2] == ["im", "+chat-create"]]) == 1
     assert state.is_enabled(SID) and not state.has_auto_pending(SID)
+
+def test_auto_connect_retries_after_listener_spawn_failure(auto, monkeypatch):
+    """真实 _enable 内拉起监听进程失败：不留 enabled、保留 auto_pending，下一句只重试开启。"""
+    def boom(*a, **k):
+        raise OSError("fork failed")
+    monkeypatch.setattr(listener, "_lock_held_by_other", lambda: False)
+    monkeypatch.setattr(listener.subprocess, "Popen", boom)
+    assert commands.auto_connect(SID, "prompt", "a") == ""
+    assert not state.is_enabled(SID) and state.has_auto_pending(SID)
+    monkeypatch.setattr(listener.subprocess, "Popen", lambda *a, **k: None)
+    assert commands.auto_connect(SID, "prompt", "b") == "enabled"
+    assert len([c for c in auto() if c[:2] == ["im", "+chat-create"]]) == 1
+    assert state.is_enabled(SID) and not state.has_auto_pending(SID)
+
+def test_auto_connect_writes_first_mirror_only_on_success(auto, monkeypatch):
+    commands.auto_connect(SID, "prompt", "a")
+    assert state.claim_first_mirror(SID, "a") is True
+    state.set_enabled(SID, False); state.mark_auto_pending(SID)
+    monkeypatch.setattr(commands, "_enable", lambda *a, **k: commands._result("boom"))
+    commands.auto_connect(SID, "prompt", "b")
+    assert state.claim_first_mirror(SID, "b") is None          # 失败时已删除
 
 def test_auto_pending_then_off_then_prompt_stays_off(auto, monkeypatch):
     real = commands._enable
@@ -413,7 +464,9 @@ def test_bind_existing_not_created_by_bridge(auto):
     assert state.load_binding(SID).created_by_bridge is False
 ```
 
-`auto` fixture：基于 `fake`，加 `claude_sessions`、`write_meta(..., os.getpid(), SID)`、`config.set_auto_on(True)`。`test_auto_connect_and_manual_do_not_create_two_chats` 按注释里的步骤与断言写全。
+`auto` fixture：基于 `fake`，加 `claude_sessions`、`write_meta(..., os.getpid(), SID)`、`config.set_auto_on(True)`，并把 `listener.ensure_running` patch 为返回 `True`（`test_auto_connect_retries_after_listener_spawn_failure` 在用例内恢复真实函数：`monkeypatch.setattr(listener, "ensure_running", real_ensure_running)`，`real_ensure_running` 在 fixture patch 之前保存）。`test_auto_connect_and_manual_do_not_create_two_chats` 按注释里的步骤与断言写全。
+
+`tests/test_listener.py` 追加：`test_ensure_running_reports_spawn_failure`（patch `Popen` 抛 `OSError` → 返回 `False`，errors.log 有 `listener.ensure_running`）与 `test_ensure_running_true_when_running`（`_lock_held_by_other` 为真 → 返回 `True` 且不调用 `Popen`）。
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -432,7 +485,7 @@ Expected: 全部 PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add lark_bridge/commands.py tests/test_commands.py
+git add lark_bridge/commands.py lark_bridge/listener.py tests/test_commands.py tests/test_listener.py
 git commit -m "feat: auto_connect for first prompt and resume, serialized with manual /lark"
 ```
 
@@ -448,7 +501,8 @@ git commit -m "feat: auto_connect for first prompt and resume, serialized with m
 **Interfaces:**
 - Consumes: `commands.auto_connect(sid, source, prompt) -> str`（Task 4）；`state.disable_if_foreign`（Task 3）。
 - Produces:
-  - `hooks._auto_wait(sid, data, start, now, sleep) -> str`：`event == "wait"` 且未开启时调用。`r = commands.auto_connect(sid, "prompt", prompt)`；`r` 非空时：`set_counter(sid, "busy", 1)`、`set_counter(sid, "keepalive_pending", 0)`、`feishu.send(chat_id, TERMINAL_PREFIX + prompt)`（这一句的同步 `prompt` hook 在开启之前已跑过，没镜像）；然后 `state.is_enabled(sid)` 为真时 `_become_waiter(...)`。
+  - `hooks._auto_wait(sid, data, start, now, sleep) -> str`：`event == "wait"` 且未开启时调用。`r = commands.auto_connect(sid, "prompt", prompt)`；`r` 非空时：`set_counter(sid, "busy", 1)`、`set_counter(sid, "keepalive_pending", 0)`、`state.claim_first_mirror(sid, prompt) is True` 时才 `feishu.send(chat_id, TERMINAL_PREFIX + prompt)`；然后 `state.is_enabled(sid)` 为真时 `_become_waiter(...)`。
+  - `_prompt`（已开启时的同步 hook）：镜像前调用 `state.claim_first_mirror(sid, prompt)`，返回 `False`（`wait` 一侧已认领并发送）时跳过 `_spawn_mirror`；返回 `True` 或 `None` 照常镜像。`prompt` 与 `wait` 是 settings 里两个独立条目，Claude Code 不保证二者先后：`prompt` 先跑时它看不到开启、不镜像，由 `_auto_wait` 认领发送；`prompt` 在开启之后才跑时，两方竞争同一个 `first_mirror` 文件，只有一方镜像。
   - `hooks._session_resume(sid, data, start, now, sleep) -> str`：`data["source"] == "resume"` 时 `commands.auto_connect(sid, "resume")`；开启后 `_become_waiter(...)`；其他 source 立刻返回 `""`。
   - `run()` 分流：`event == "wait"` 且未开启 → `_auto_wait`；`event == "session-resume"` → `_session_resume`（不受 is_enabled 门控）。两者都先 `_install_sigterm()`。
   - `_session_start`：source 在 `_START_DISCONNECT` 时，`pid = procs.find_claude_ancestor()`；pid 非 None 用 `state.disable_if_foreign(sid, pid, procs.start_time(pid))`，返回 True 才写原有日志；pid 为 None 退回 `state.set_enabled(sid, False)`。
@@ -457,7 +511,7 @@ git commit -m "feat: auto_connect for first prompt and resume, serialized with m
 
 - [ ] **Step 1: Write the failing tests**
 
-`tests/test_hooks_auto.py`（复用 `test_hooks_stop` 的 `fake`、`Clock`、`prompt_input`、`sent_texts`，以及 Task 2/4 的 meta 写法；`commands.procs.find_claude_ancestor` 和 `hooks` 用到的 `procs.find_claude_ancestor` 都 patch 为 `os.getpid`；`listener.ensure_running` patch 为空操作；`CLAUDE_LARK_IDLE_SECONDS` 设为 `"1"`，等待进程在虚拟时钟上 1 秒后到期；因为 `busy == 1`，到期返回 `""`）。辅助函数 `saved_binding()` 写 `state.Binding(SID, "oc_test_chat", "测试群", "/work", None, 1.0)`，不开启：
+`tests/test_hooks_auto.py`（复用 `test_hooks_stop` 的 `fake`、`Clock`、`prompt_input`、`sent_texts`，以及 Task 2/4 的 meta 写法；`commands.procs.find_claude_ancestor` 和 `hooks` 用到的 `procs.find_claude_ancestor` 都 patch 为 `os.getpid`；`listener.ensure_running` patch 为返回 `True`（下面注明恢复真实函数的用例除外）；`hooks._spawn_mirror` patch 为记录调用（`mirrors` 列表），首句镜像次数 = `sent_texts` 里 `"💻 终端：<prompt>"` 的条数 + `mirrors` 里等于 `<prompt>` 的条数；`CLAUDE_LARK_IDLE_SECONDS` 设为 `"1"`，等待进程在虚拟时钟上 1 秒后到期；因为 `busy == 1`，到期返回 `""`）。辅助函数 `saved_binding()` 写 `state.Binding(SID, "oc_test_chat", "测试群", "/work", None, 1.0)`，不开启：
 
 ```python
 def test_wait_hook_auto_creates_and_mirrors_first_prompt(auto):
@@ -467,6 +521,48 @@ def test_wait_hook_auto_creates_and_mirrors_first_prompt(auto):
     assert "💻 终端：修 bug" in sent_texts(auto())
     assert state.get_counter(SID, "busy") == 1
     assert out == "" and clock.sleeps > 0          # 成为了等待进程，等到 deadline
+
+def test_first_prompt_mirrored_once_prompt_hook_first(auto, mirrors):
+    """常见顺序：同步 prompt hook 先跑（未开启，不镜像），wait 再自动开启并发送。"""
+    clock = Clock()
+    hooks.run("prompt", prompt_input("修 bug"), clock.now, clock.sleep)
+    hooks.run("wait", prompt_input("修 bug"), clock.now, clock.sleep)
+    assert first_mirror_count(auto, mirrors, "修 bug") == 1
+
+def test_first_prompt_mirrored_once_prompt_hook_after_enable(auto, mirrors):
+    """prompt hook 在 wait 完成开启之后才跑：wait 已认领，prompt hook 不再镜像。"""
+    clock = Clock()
+    hooks.run("wait", prompt_input("修 bug"), clock.now, clock.sleep)
+    hooks.run("prompt", prompt_input("修 bug"), clock.now, clock.sleep)
+    assert first_mirror_count(auto, mirrors, "修 bug") == 1
+
+def test_first_prompt_mirrored_once_interleaved(auto, mirrors, monkeypatch):
+    """开启之后、wait 认领之前插入 prompt hook：prompt hook 认领，wait 不再发送。"""
+    clock = Clock()
+    real = commands.auto_connect
+    def connect_then_prompt(*a, **k):
+        r = real(*a, **k)
+        hooks.run("prompt", prompt_input("修 bug"), clock.now, clock.sleep)
+        return r
+    monkeypatch.setattr(commands, "auto_connect", connect_then_prompt)
+    hooks.run("wait", prompt_input("修 bug"), clock.now, clock.sleep)
+    assert first_mirror_count(auto, mirrors, "修 bug") == 1
+    assert mirrors == ["修 bug"]
+
+def test_wait_hook_recovers_after_listener_spawn_failure(auto, monkeypatch):
+    """真实 ensure_running 拉起失败 → 不开启；下一句的 wait hook 走 _auto_wait 重试，不重复建群。"""
+    monkeypatch.setattr(listener, "ensure_running", real_ensure_running)
+    monkeypatch.setattr(listener, "_lock_held_by_other", lambda: False)
+    def boom(*a, **k):
+        raise OSError("fork failed")
+    monkeypatch.setattr(listener.subprocess, "Popen", boom)
+    clock = Clock()
+    hooks.run("wait", prompt_input("a"), clock.now, clock.sleep)
+    assert not state.is_enabled(SID) and state.has_auto_pending(SID)
+    monkeypatch.setattr(listener.subprocess, "Popen", lambda *a, **k: None)
+    hooks.run("wait", prompt_input("b"), clock.now, clock.sleep)
+    assert state.is_enabled(SID) and not state.has_auto_pending(SID)
+    assert len([c for c in auto() if c[:2] == ["im", "+chat-create"]]) == 1
 
 def test_wait_hook_noop_when_auto_off(auto):
     config.set_auto_on(False)
@@ -501,7 +597,7 @@ def test_session_start_removes_enabled_of_other_process(auto):
     assert not state.is_enabled(SID)
 ```
 
-`...` 处用 `Clock()` 的 `now`、`sleep`，与 `test_hooks_stop` 的调用方式相同。现有 `test_session_start_disables_silently` 用的 `bridged` fixture 写的是无 pid 的 enabled（空文件），它与当前进程不符，仍应被删除——保持该测试不改并确认通过。
+`...` 处用 `Clock()` 的 `now`、`sleep`，与 `test_hooks_stop` 的调用方式相同。`mirrors` fixture 返回记录 `_spawn_mirror` 文本的列表；`first_mirror_count(auto, mirrors, p)` 按上面的定义计数；`real_ensure_running` 是模块加载时保存的 `listener.ensure_running` 原函数。现有 `test_session_start_disables_silently` 用的 `bridged` fixture 写的是无 pid 的 enabled（空文件），它与当前进程不符，仍应被删除——保持该测试不改并确认通过。
 
 `tests/test_settings.py`：`test_merge_into_empty` 的 `len(_ours(cfg)) == 6` 改为 `7`，并加：
 
