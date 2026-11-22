@@ -32,7 +32,7 @@
 4. `/lark auto`、`/lark auto onx`、`/lark  auto on `（首尾空白）：前两个按群名处理，最后一个去空白后是开关命令（Task 1 `test_auto_args_must_match_whole_string`）。
 5. 同一轮里连续两次 `/rename`、或改名接口持续失败：只同步最新的名字；失败 60 秒内不重试、群里只提示一次（Task 6 `test_rename_failure_cooldown_and_single_notice`）。
 6. 自动开启时拉起监听进程失败：不留 enabled、保留 `auto_pending`，下一句只重试开启（Task 4 `test_auto_connect_retries_after_listener_spawn_failure`、Task 5 `test_wait_hook_recovers_after_listener_spawn_failure`）。
-7. `prompt` 与 `wait` 两个 hook 任意先后、交错：首句恰好镜像一次；认领过的首句不吞掉之后文本相同的新输入（Task 3 `test_first_mirror_*`、Task 5 `test_first_prompt_mirrored_once_*`、`test_later_identical_prompt_still_mirrored`）。
+7. 终端输入只由 `wait` hook 镜像（`prompt` hook 只改计数器）：`prompt` 与 `wait` 任意先后，首句恰好镜像一次；紧接着再次提交相同文本（不论间隔多短）也各镜像一次（Task 5 `test_first_prompt_mirrored_once_*`、`test_rapid_identical_prompts_each_mirrored`）。
 
 ---
 
@@ -207,16 +207,6 @@ git commit -m "feat: read Claude Code session metadata"
   - `state.disable_if_foreign(sid, pid: int, start_time: str) -> bool`：`enabled.lock` 内重读 enabled；内容等于 `f"{pid}\n{start_time}"`（空白归一后比较）就保留并返回 `False`；否则删除并返回 `True`（文件不存在返回 `False`）。读完之后、判断之前调用模块级钩子 `state._after_foreign_read`（默认 `None`，仅测试注入）。
   - `is_enabled()` 判定失效后的删除改为：`enabled.lock` 内重读，内容仍等于当初读到的才删。
   - `state.mark_auto_pending(sid)`、`state.has_auto_pending(sid) -> bool`、`state.clear_auto_pending(sid)`：会话目录里的 `auto_pending` 文件，`clear` 对不存在的文件不报错。
-  - 首句镜像认领（保证首句恰好镜像一次，不依赖 `prompt` 与 `wait` 两个 hook 的执行顺序）：
-    - 输入事件标识：`(text, at)`。`at` 是该次输入触发 hook 时的墙钟时间（`time.time()`，在各 hook 入口取，早于建群等耗时步骤）。Claude Code 对同一次输入**同时**拉起 `prompt` 与 `wait` 两个 hook 进程，二者的 `at` 只差进程启动时间；UserPromptSubmit 的 hook 输入没有每次输入唯一的 id，所以用"文本相同且 `at` 相差不超过 `state.FIRST_MIRROR_WINDOW = 10.0` 秒"判定为同一次输入。
-    - 状态文件两个，都在会话目录：`first_mirror`（待认领）与 `first_mirror.claimed`（已被一方认领、另一方还没确认），内容都是 JSON `{"text": ..., "at": ...}`。
-    - `state.write_first_mirror(sid, text, at)`：先删除残留的 `first_mirror.claimed`，再原子写 `first_mirror`。
-    - `state.claim_first_mirror(sid, text, at) -> Optional[bool]`，按顺序：
-      1. 读 `first_mirror`：存在且与 `(text, at)` 匹配时 `os.rename(first_mirror, first_mirror.claimed)`；成功返回 `True`（本调用方负责镜像）；`FileNotFoundError`（对方先改名）转第 2 步。存在但不匹配返回 `None`。不存在转第 2 步。
-      2. 读 `first_mirror.claimed`：存在且与 `(text, at)` 匹配时删除它（两方都已见过这次输入，容忍 `FileNotFoundError`）并返回 `False`（另一方已认领）；存在但不匹配（过期残留）时删除它并返回 `None`；不存在返回 `None`。
-      `rename` 与 `unlink` 都是原子的：两方并发认领只有一方得到 `True`，后到的一方一定读到 `first_mirror.claimed` 而返回 `False`，不会因为"文件已不存在"误判为无关输入。
-      清理规则：第二方确认时删除 `first_mirror.claimed`；`prompt` hook 在开启前就跑完（从不认领）时，`first_mirror.claimed` 留到下一次已开启的 `prompt` hook，因 `at` 超出窗口被当作过期残留删除，该次输入照常镜像；`write_first_mirror` 与 `drop_first_mirror` 也会清掉它。残余风险：开启后 10 秒内再次提交与首句完全相同的文本，这一句不镜像（至多漏镜像一条，不重复发送）。
-    - `state.drop_first_mirror(sid)`：删除 `first_mirror` 与 `first_mirror.claimed`，对不存在的文件不报错。
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -278,48 +268,6 @@ def test_auto_pending_marker(lark_home):
     state.mark_auto_pending(SID); assert state.has_auto_pending(SID)
     state.clear_auto_pending(SID); state.clear_auto_pending(SID)
     assert not state.has_auto_pending(SID)
-
-T0 = 1000.0
-
-def test_first_mirror_claim(lark_home):
-    assert state.claim_first_mirror(SID, "a", T0) is None       # 没有标记
-    state.write_first_mirror(SID, "a", T0)
-    assert state.claim_first_mirror(SID, "b", T0) is None       # 文本不同
-    assert state.claim_first_mirror(SID, "a", T0 + 60) is None  # 不是同一次输入
-    assert state.claim_first_mirror(SID, "a", T0 + 1) is True   # 第一方认领
-    assert state.claim_first_mirror(SID, "a", T0 + 2) is False  # 第二方：已被认领
-    assert state.claim_first_mirror(SID, "a", T0 + 3) is None   # 两方都确认过，状态已清
-    d = paths.session_dir(SID)
-    assert not (d / "first_mirror").exists() and not (d / "first_mirror.claimed").exists()
-
-def test_first_mirror_stale_claimed_does_not_swallow_later_input(lark_home):
-    """prompt hook 在开启前跑完、从不认领：残留的 claimed 不吞掉之后文本相同的新输入。"""
-    state.write_first_mirror(SID, "a", T0)
-    assert state.claim_first_mirror(SID, "a", T0) is True       # 只有 wait 一方认领
-    assert state.claim_first_mirror(SID, "a", T0 + 60) is None  # 下一次输入：过期残留
-    assert not (paths.session_dir(SID) / "first_mirror.claimed").exists()
-
-def test_first_mirror_write_and_drop_clear_claimed(lark_home):
-    state.write_first_mirror(SID, "a", T0); state.claim_first_mirror(SID, "a", T0)
-    state.write_first_mirror(SID, "b", T0 + 60)
-    assert not (paths.session_dir(SID) / "first_mirror.claimed").exists()
-    state.claim_first_mirror(SID, "b", T0 + 60)
-    state.drop_first_mirror(SID); state.drop_first_mirror(SID)
-    d = paths.session_dir(SID)
-    assert not (d / "first_mirror").exists() and not (d / "first_mirror.claimed").exists()
-
-def test_first_mirror_claim_race(lark_home, monkeypatch):
-    """两方都读到匹配的 first_mirror 后，只有先 rename 的一方得到 True，后到的一方得到 False。"""
-    state.write_first_mirror(SID, "a", T0)
-    real_rename = os.rename
-    seen = []
-    def rename_after_other(src, dst, *a, **k):
-        monkeypatch.setattr(os, "rename", real_rename)
-        seen.append(state.claim_first_mirror(SID, "a", T0))     # 对方抢先改名
-        real_rename(src, dst, *a, **k)                          # 本方改名时源已不存在
-    monkeypatch.setattr(os, "rename", rename_after_other)
-    assert state.claim_first_mirror(SID, "a", T0) is False
-    assert seen == [True]
 ```
 
 - [ ] **Step 2: Run to verify they fail**
@@ -340,7 +288,7 @@ Expected: 全部 PASS
 
 ```bash
 git add lark_bridge/state.py tests/test_state.py
-git commit -m "feat: binding sync fields, connect/binding/enabled locks, auto_pending and first_mirror markers"
+git commit -m "feat: binding sync fields, connect/binding/enabled locks, auto_pending marker"
 ```
 
 ---
@@ -352,17 +300,16 @@ git commit -m "feat: binding sync fields, connect/binding/enabled locks, auto_pe
 - Test: `tests/test_commands.py`、`tests/test_listener.py`
 
 **Interfaces:**
-- Consumes: `config.auto_on()`、`meta.is_interactive()`、`meta.session_name()`（Task 1、2）；`state.connect_lock`、`update_binding`、`mark_auto_pending`、`has_auto_pending`、`clear_auto_pending`、`write_first_mirror`、`drop_first_mirror`（Task 3）。
+- Consumes: `config.auto_on()`、`meta.is_interactive()`、`meta.session_name()`（Task 1、2）；`state.connect_lock`、`update_binding`、`mark_auto_pending`、`has_auto_pending`、`clear_auto_pending`（Task 3）。
 - Produces:
   - `listener.ensure_running() -> bool`：监听进程已在跑（`_lock_held_by_other()` 为真）或本次 `Popen` 成功返回 `True`；捕获到异常时照旧 `log_exception` 并返回 `False`。仍然不抛出。
   - `_enable` 在 `set_enabled` 且 `is_enabled` 通过之后调用 `listener.ensure_running()`；返回 `False` 时 `state.set_enabled(sid, False)`、`log_error`，并返回 `_result("拉起监听进程失败，未开启桥接，详见 errors.log")`。这样开启失败时 enabled 不留下，`auto_pending` 不被清除，下一句的 `wait` hook 仍走未开启分支（`_auto_wait`）重试。
   - `commands.AUTO_NAME_MAX = 20`
   - `commands.auto_name(prompt: str, session_name: str, cwd: str) -> str`：按 Global Constraints 的群名规则。
-  - `commands.auto_connect(sid: str, source: str, prompt: str = "", at: Optional[float] = None) -> str`：`at` 是输入事件时间，`None` 时取 `time.time()`；返回 `"created"`（本次建群并开启）、`"enabled"`（复用已有 binding 并开启）或 `""`（没做或失败）。`source` 取 `"prompt"` 或 `"resume"`。自身不抛出，异常走 `feishu.log_exception("commands.auto_connect")`。
+  - `commands.auto_connect(sid: str, source: str, prompt: str = "") -> str`：返回 `"created"`（本次建群并开启）、`"enabled"`（复用已有 binding 并开启）或 `""`（没做或失败）。`source` 取 `"prompt"` 或 `"resume"`。自身不抛出，异常走 `feishu.log_exception("commands.auto_connect")`。
   - `_create_and_enable(sid, name, owner, pid, auto=False)`：binding 写入 `created_by_bridge=True`、`synced_name=meta.session_name(pid, sid)`；`auto=True` 时**先** `mark_auto_pending` 再落 binding（都在调用方持有的 `connect.lock` 内）。
   - `_bind_existing` 写入 `created_by_bridge=False`、`synced_name=meta.session_name(pid, sid)`。
   - `_enable` 写 `claude_pid` / `cwd` 改用 `state.update_binding(sid, fn, default=b)`；开启成功（`state.is_enabled(sid)` 为真**且** `listener.ensure_running()` 返回 `True`）后调用 `state.clear_auto_pending(sid)`。
-  - `auto_connect` 在 `source == "prompt"` 的"建群并开启"与"只重试开启"两条路径上，于锁内、调用 `_enable` **之前**执行 `state.write_first_mirror(sid, prompt, at)`；开启失败（返回 `""`）时 `state.drop_first_mirror(sid)`。resume 路径不写。
   - `_slash` 与 `_on` 的 "读 binding → 决定 → 建群/绑定/开启" 整段放进 `state.connect_lock(sid)`。
   - `_off` 在 `connect_lock` 内先 `clear_auto_pending`，再读 binding、断开。
 
@@ -423,14 +370,6 @@ def test_auto_connect_retries_after_listener_spawn_failure(auto, monkeypatch):
     assert commands.auto_connect(SID, "prompt", "b") == "enabled"
     assert len([c for c in auto() if c[:2] == ["im", "+chat-create"]]) == 1
     assert state.is_enabled(SID) and not state.has_auto_pending(SID)
-
-def test_auto_connect_writes_first_mirror_only_on_success(auto, monkeypatch):
-    commands.auto_connect(SID, "prompt", "a", at=1000.0)
-    assert state.claim_first_mirror(SID, "a", 1000.0) is True
-    state.set_enabled(SID, False); state.mark_auto_pending(SID)
-    monkeypatch.setattr(commands, "_enable", lambda *a, **k: commands._result("boom"))
-    commands.auto_connect(SID, "prompt", "b", at=2000.0)
-    assert state.claim_first_mirror(SID, "b", 2000.0) is None  # 失败时已删除
 
 def test_auto_pending_then_off_then_prompt_stays_off(auto, monkeypatch):
     real = commands._enable
@@ -523,14 +462,16 @@ git commit -m "feat: auto_connect for first prompt and resume, serialized with m
 **Files:**
 - Modify: `lark_bridge/hooks.py`
 - Modify: `lark_bridge/settings.py`
-- Test: `tests/test_hooks_auto.py`（新建）、`tests/test_hooks_stop.py`、`tests/test_settings.py`
+- Test: `tests/test_hooks_auto.py`（新建）、`tests/test_hooks_stop.py`、`tests/test_hooks_interactive.py`、`tests/test_settings.py`
 
 **Interfaces:**
-- Consumes: `commands.auto_connect(sid, source, prompt, at) -> str`（Task 4）；`state.claim_first_mirror`（Task 3）；`state.disable_if_foreign`（Task 3）。
+- Consumes: `commands.auto_connect(sid, source, prompt) -> str`（Task 4）；`state.disable_if_foreign`（Task 3）。
 - Produces:
-  - `hooks._wall()`：返回 `time.time()`，模块级函数，测试 patch 它控制输入事件时间。
-  - `hooks._auto_wait(sid, data, start, now, sleep) -> str`：`event == "wait"` 且未开启时调用。入口处 `at = _wall()`（早于建群），`r = commands.auto_connect(sid, "prompt", prompt, at=at)`；`r` 非空时：`set_counter(sid, "busy", 1)`、`set_counter(sid, "keepalive_pending", 0)`、`state.claim_first_mirror(sid, prompt, at) is True` 时才 `feishu.send(chat_id, TERMINAL_PREFIX + prompt)`；然后 `state.is_enabled(sid)` 为真时 `_become_waiter(...)`。
-  - `_prompt`（已开启时的同步 hook）：入口处 `at = _wall()`；镜像前调用 `state.claim_first_mirror(sid, prompt, at)`，返回 `False`（`wait` 一侧已认领并发送）时跳过 `_spawn_mirror`；返回 `True` 或 `None` 照常镜像。`prompt` 与 `wait` 是 settings 里两个独立条目，Claude Code 不保证二者先后：`prompt` 先跑时它看不到开启、不镜像，由 `_auto_wait` 认领发送；`prompt` 在开启之后才跑时，两方按 Task 3 的协议认领，先到的一方镜像，后到的一方读到 `first_mirror.claimed` 而跳过。
+  - 镜像只有一个执行方：`prompt` 与 `wait` 是 settings 里两个独立的 UserPromptSubmit 条目，Claude Code 不保证二者先后，hook 输入里也没有每次输入唯一的 id，无法可靠判断两个进程看到的是不是同一次输入。所以把终端输入的镜像**整体**从同步的 `prompt` hook 挪到后台的 `wait` hook：每次输入只拉起一个 `wait` 进程，它是这次输入唯一的镜像方，首句与之后的输入走同一条路径，不需要跨进程认领，也不需要时间窗口。`prompt` hook 保留为同步条目，只做必须在回合开始前完成的计数器更新。settings 的 UserPromptSubmit 条目不变。
+  - `hooks._mirror_input(sid, prompt) -> None`：`prompt` 是非空字符串、`lstrip()` 后不以 `/lark` 或 `<task-notification>` 开头时调用 `_spawn_mirror(sid, prompt)`；否则什么都不做。镜像仍交给脱离的后台进程发送，不拖慢之后成为等待进程。
+  - `_prompt`（已开启时的同步 hook）：删除 `_spawn_mirror` 调用，其余不变（`<task-notification>` 直接返回；否则 `busy = 1`、`keepalive_pending = 0`）。
+  - `_wait`（已开启时）：先 `_mirror_input(sid, data.get("prompt"))`，再 `_become_waiter(...)`。已有等待进程时 `_become_waiter` 立刻返回，镜像不受影响。
+  - `hooks._auto_wait(sid, data, start, now, sleep) -> str`：`event == "wait"` 且未开启时调用。`r = commands.auto_connect(sid, "prompt", prompt)`；`r` 非空时：`set_counter(sid, "busy", 1)`、`set_counter(sid, "keepalive_pending", 0)`（`prompt` hook 先跑时看到未开启，没有改计数器）、`_mirror_input(sid, prompt)`；然后 `state.is_enabled(sid)` 为真时 `_become_waiter(...)`。`r` 为空时不镜像（未开启，`prompt` hook 也不会镜像）。
   - `hooks._session_resume(sid, data, start, now, sleep) -> str`：`data["source"] == "resume"` 时 `commands.auto_connect(sid, "resume")`；开启后 `_become_waiter(...)`；其他 source 立刻返回 `""`。
   - `run()` 分流：`event == "wait"` 且未开启 → `_auto_wait`；`event == "session-resume"` → `_session_resume`（不受 is_enabled 门控）。两者都先 `_install_sigterm()`。
   - `_session_start`：source 在 `_START_DISCONNECT` 时，`pid = procs.find_claude_ancestor()`；pid 非 None 用 `state.disable_if_foreign(sid, pid, procs.start_time(pid))`，返回 True 才写原有日志；pid 为 None 退回 `state.set_enabled(sid, False)`。
@@ -539,33 +480,34 @@ git commit -m "feat: auto_connect for first prompt and resume, serialized with m
 
 - [ ] **Step 1: Write the failing tests**
 
-`tests/test_hooks_auto.py`（复用 `test_hooks_stop` 的 `fake`、`Clock`、`prompt_input`、`sent_texts`，以及 Task 2/4 的 meta 写法；`commands.procs.find_claude_ancestor` 和 `hooks` 用到的 `procs.find_claude_ancestor` 都 patch 为 `os.getpid`；`listener.ensure_running` patch 为返回 `True`（下面注明恢复真实函数的用例除外）；`hooks._spawn_mirror` patch 为记录调用（`mirrors` 列表），首句镜像次数 = `sent_texts` 里 `"💻 终端：<prompt>"` 的条数 + `mirrors` 里等于 `<prompt>` 的条数；`CLAUDE_LARK_IDLE_SECONDS` 设为 `"1"`，等待进程在虚拟时钟上 1 秒后到期；因为 `busy == 1`，到期返回 `""`）。辅助函数 `saved_binding()` 写 `state.Binding(SID, "oc_test_chat", "测试群", "/work", None, 1.0)`，不开启：
+`tests/test_hooks_auto.py`（复用 `test_hooks_stop` 的 `fake`、`Clock`、`prompt_input`、`sent_texts`，以及 Task 2/4 的 meta 写法；`commands.procs.find_claude_ancestor` 和 `hooks` 用到的 `procs.find_claude_ancestor` 都 patch 为 `os.getpid`；`listener.ensure_running` patch 为返回 `True`（下面注明恢复真实函数的用例除外）；`hooks._spawn_mirror` patch 为记录调用（`mirrors` 列表），所有镜像都经 `_spawn_mirror`，所以镜像次数直接看 `mirrors`；`CLAUDE_LARK_IDLE_SECONDS` 设为 `"1"`，等待进程在虚拟时钟上 1 秒后到期；因为 `busy == 1`，到期返回 `""`）。辅助函数 `saved_binding()` 写 `state.Binding(SID, "oc_test_chat", "测试群", "/work", None, 1.0)`，不开启：
 
 ```python
-def test_wait_hook_auto_creates_and_mirrors_first_prompt(auto):
+def test_wait_hook_auto_creates_and_mirrors_first_prompt(auto, mirrors):
     clock = Clock()
     out = hooks.run("wait", prompt_input("修 bug"), clock.now, clock.sleep)
     assert state.is_enabled(SID)
-    assert "💻 终端：修 bug" in sent_texts(auto())
+    assert mirrors == ["修 bug"]
     assert state.get_counter(SID, "busy") == 1
     assert out == "" and clock.sleeps > 0          # 成为了等待进程，等到 deadline
 
 def test_first_prompt_mirrored_once_prompt_hook_first(auto, mirrors):
-    """常见顺序：同步 prompt hook 先跑（未开启，不镜像），wait 再自动开启并发送。"""
+    """常见顺序：同步 prompt hook 先跑（未开启，什么都不做），wait 再自动开启并镜像。"""
     clock = Clock()
     hooks.run("prompt", prompt_input("修 bug"), clock.now, clock.sleep)
     hooks.run("wait", prompt_input("修 bug"), clock.now, clock.sleep)
-    assert first_mirror_count(auto, mirrors, "修 bug") == 1
+    assert mirrors == ["修 bug"]
 
 def test_first_prompt_mirrored_once_prompt_hook_after_enable(auto, mirrors):
-    """prompt hook 在 wait 完成开启之后才跑：wait 已认领，prompt hook 不再镜像。"""
+    """prompt hook 在 wait 完成开启之后才跑：prompt hook 只改计数器，不镜像。"""
     clock = Clock()
     hooks.run("wait", prompt_input("修 bug"), clock.now, clock.sleep)
     hooks.run("prompt", prompt_input("修 bug"), clock.now, clock.sleep)
-    assert first_mirror_count(auto, mirrors, "修 bug") == 1
+    assert mirrors == ["修 bug"]
+    assert state.get_counter(SID, "busy") == 1
 
 def test_first_prompt_mirrored_once_interleaved(auto, mirrors, monkeypatch):
-    """开启之后、wait 认领之前插入 prompt hook：prompt hook 认领，wait 不再发送。"""
+    """开启之后、wait 镜像之前插入 prompt hook：仍只由 wait 镜像一次。"""
     clock = Clock()
     real = commands.auto_connect
     def connect_then_prompt(*a, **k):
@@ -574,19 +516,23 @@ def test_first_prompt_mirrored_once_interleaved(auto, mirrors, monkeypatch):
         return r
     monkeypatch.setattr(commands, "auto_connect", connect_then_prompt)
     hooks.run("wait", prompt_input("修 bug"), clock.now, clock.sleep)
-    assert first_mirror_count(auto, mirrors, "修 bug") == 1
     assert mirrors == ["修 bug"]
 
-def test_later_identical_prompt_still_mirrored(auto, mirrors, monkeypatch):
-    """首句由 wait 认领（prompt hook 开启前已跑完）；之后再输入相同文本，照常镜像。"""
-    t = [1000.0]
-    monkeypatch.setattr(hooks, "_wall", lambda: t[0])
+def test_rapid_identical_prompts_each_mirrored(auto, mirrors):
+    """首句之后立刻（同一虚拟时刻，远小于 10 秒）再次提交相同文本：两次输入各镜像一次。"""
     clock = Clock()
-    hooks.run("prompt", prompt_input("修 bug"), clock.now, clock.sleep)
-    hooks.run("wait", prompt_input("修 bug"), clock.now, clock.sleep)
-    t[0] += 60
-    hooks.run("prompt", prompt_input("修 bug"), clock.now, clock.sleep)
-    assert first_mirror_count(auto, mirrors, "修 bug") == 2
+    for _ in range(2):                             # 每次输入：prompt 与 wait 各跑一次
+        hooks.run("prompt", prompt_input("修 bug"), clock.now, clock.sleep)
+        hooks.run("wait", prompt_input("修 bug"), clock.now, clock.sleep)
+    assert mirrors == ["修 bug", "修 bug"]
+    assert len([c for c in auto() if c[:2] == ["im", "+chat-create"]]) == 1
+
+def test_wait_hook_does_not_mirror_special_prompts(auto, mirrors):
+    clock = Clock()
+    hooks.run("wait", prompt_input("修 bug"), clock.now, clock.sleep)   # 开启
+    for p in ["/lark status", "<task-notification>x", "   "]:
+        hooks.run("wait", prompt_input(p), clock.now, clock.sleep)
+    assert mirrors == ["修 bug"]
 
 def test_wait_hook_recovers_after_listener_spawn_failure(auto, monkeypatch):
     """真实 ensure_running 拉起失败 → 不开启；下一句的 wait hook 走 _auto_wait 重试，不重复建群。"""
@@ -636,7 +582,14 @@ def test_session_start_removes_enabled_of_other_process(auto):
     assert not state.is_enabled(SID)
 ```
 
-`...` 处用 `Clock()` 的 `now`、`sleep`，与 `test_hooks_stop` 的调用方式相同。`mirrors` fixture 返回记录 `_spawn_mirror` 文本的列表；`first_mirror_count(auto, mirrors, p)` 按上面的定义计数；`real_ensure_running` 是模块加载时保存的 `listener.ensure_running` 原函数。现有 `test_session_start_disables_silently` 用的 `bridged` fixture 写的是无 pid 的 enabled（空文件），它与当前进程不符，仍应被删除——保持该测试不改并确认通过。
+`...` 处用 `Clock()` 的 `now`、`sleep`，与 `test_hooks_stop` 的调用方式相同。`mirrors` fixture 返回记录 `_spawn_mirror` 文本的列表；`real_ensure_running` 是模块加载时保存的 `listener.ensure_running` 原函数。现有 `test_session_start_disables_silently` 用的 `bridged` fixture 写的是无 pid 的 enabled（空文件），它与当前进程不符，仍应被删除——保持该测试不改并确认通过。
+
+现有测试随"镜像挪到 `wait`"调整（`bridged` fixture 下）：
+- `tests/test_hooks_stop.py::test_prompt_mirrors_terminal_input_and_marks_busy` 拆成两条：`test_prompt_marks_busy_without_mirroring`（`prompt` hook 后 `busy == 1`、`keepalive_pending == 0`，等 0.5 秒 `sent_texts` 仍为空）与 `test_wait_mirrors_terminal_input`（`wait` hook 后 `_wait_until(sent_texts == ["💻 终端：修一下 bug"])`）。
+- `test_prompt_does_not_mirror_lark_command` 改为对 `wait` 断言（`/lark off`、`/lark` 都不发送）；`test_prompt_ignores_wake_up_notification` 保留，并加一条 `wait` 收到 `NOTIFICATION` 时不发送。
+- `test_prompt_mirror_does_not_block_terminal` 改名 `test_wait_mirror_is_detached`：`FAKE_LARK_SLEEP=3` 下持有等待锁（`state.try_lock_waiter`）后跑 `wait`，返回耗时 < 1.5 秒，后台进程随后发出镜像、临时文件删除。
+- `tests/test_hooks_interactive.py::test_prompt_hook_makes_no_inline_send` 保持不变并确认通过（`prompt` hook 现在完全不发送）。
+- `test_stop_no_keepalive_while_busy` 用 `prompt` hook 设 `busy`，行为不变，保持不改。
 
 `tests/test_settings.py`：`test_merge_into_empty` 的 `len(_ours(cfg)) == 6` 改为 `7`，并加：
 
@@ -665,7 +618,7 @@ Expected: 全部 PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add lark_bridge/hooks.py lark_bridge/settings.py tests/test_hooks_auto.py tests/test_hooks_stop.py tests/test_settings.py
+git add lark_bridge/hooks.py lark_bridge/settings.py tests/test_hooks_auto.py tests/test_hooks_stop.py tests/test_hooks_interactive.py tests/test_settings.py
 git commit -m "feat: auto-connect from wait hook, resume reattach hook, foreign-only cleanup"
 ```
 
