@@ -434,3 +434,37 @@ def test_has_hooks_false_without_session_resume():
     cfg = settings.merge({})
     del cfg["hooks"]["SessionStart"][1]
     assert not settings.has_hooks(cfg)
+
+
+def test_doctor_rename_scope_missing(monkeypatch, tmp_path, lark_home, capsys):
+    home, cli = _doctor(
+        monkeypatch, tmp_path, lark_home, FAKE_LARK_BOT_SCOPE="im:message"
+    )
+    _install_fake(home)
+    rc = cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert "缺少改群名权限 im:chat:update" in out and rc == 1
+
+
+def test_doctor_rename_scope_present(monkeypatch, tmp_path, lark_home, capsys):
+    home, cli = _doctor(
+        monkeypatch,
+        tmp_path,
+        lark_home,
+        FAKE_LARK_BOT_SCOPE="im:message im:chat:update",
+    )
+    _install_fake(home)
+    rc = cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert "有改群名权限" in out and rc == 0
+
+
+def test_doctor_rename_scope_unknown_not_reported(
+    monkeypatch, tmp_path, lark_home, capsys
+):
+    monkeypatch.delenv("FAKE_LARK_BOT_SCOPE", raising=False)
+    home, cli = _doctor(monkeypatch, tmp_path, lark_home)
+    _install_fake(home)
+    rc = cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert "im:chat:update" not in out and rc == 0

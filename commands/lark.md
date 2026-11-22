@@ -1,5 +1,5 @@
 ---
-description: 把当前会话桥接到飞书群（/lark [群名|chat_id|off|status]）
+description: 把当前会话桥接到飞书群（/lark [群名|chat_id|off|status|auto on|auto off]）
 allowed-tools: Bash(~/.claude/lark/app/bin/claude-lark:*)
 ---
 !`~/.claude/lark/app/bin/claude-lark slash --session ${CLAUDE_SESSION_ID} --args "$ARGUMENTS"`

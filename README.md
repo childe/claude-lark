@@ -29,7 +29,8 @@ is the Python standard library only.
  (terminal dialog too) |<------ inbox <---------------------------------------- "同意" / "拒绝"
 ```
 
-Sessions with the bridge off are untouched: every hook exits 0 immediately with empty output.
+Sessions with the bridge off are untouched: every hook exits 0 immediately with empty output
+(unless you turned on auto connect, see [Usage](#usage)).
 
 ## 中文摘要
 
@@ -43,7 +44,8 @@ claude-lark 把一个**正在运行**的 Claude Code 会话桥接到飞书群，
 - 安装：`git clone https://github.com/childe/claude-lark ~/.claude/lark-src && ~/.claude/lark-src/install.sh`，然后重启已经开着的 claude 会话。
 - 前置：Python ≥ 3.9、Claude Code ≥ 2.1.287、`lark-cli` ≥ 1.0.92，以及一个开了机器人能力的飞书自建应用（不需要订阅事件）。
 - 收消息：监听进程以**你的 user 身份**每 2 秒拉一次已开启群的消息，不占用应用的事件长连接，所以同一个应用被别的后端订阅着也不影响。
-- 限制：resume 后不自动重连；不能从飞书远程启动 claude。
+- 自动连接：`/lark auto on` 之后，新会话发出第一句就自动建群并开启桥接，`/resume` 绑过群的会话时自动接回；`/lark auto off` 关闭。claude-lark 自己建的群，群名跟着会话名（`/rename` 或自动起的名字）改。
+- 限制：没开 `auto on` 时 resume 后不自动重连；不能从飞书远程启动 claude。
 - 从旧版本升级：`git pull` 之后**重新运行 `install.sh`**（hook 配置变了），再重启已经开着的 claude 会话。
 - 把仓库链接贴给你的 AI 助手说"帮我装"也可以，见 [For AI agents](#for-ai-agents)。
 
@@ -76,6 +78,7 @@ connection for the same app, an event consumer here would silently miss most mes
    | `im:message:send_as_bot` | bot | `lark-cli im +messages-send --as bot`: replies, permission prompts, "connected" notices. |
    | `im:chat:create` | bot | `lark-cli im +chat-create --as bot`: `/lark` creates the group. |
    | `im:chat.members:read` | bot | `lark-cli im +chat-members-list --as bot`: `/lark oc_...` checks that the bot is in the group. |
+   | `im:chat:update` | bot | `lark-cli im +chat-update --as bot`: renames groups that claude-lark created, so the group name follows the session name. |
    | `im:chat:read` (optional) | user | `lark-cli im +chat-search`, only needed for the "find a chat_id by name" tip below. |
 
 3. **Create a version and publish the app** (scopes only take effect after publishing and, for a company tenant, admin approval). No event subscription is needed.
@@ -94,7 +97,7 @@ What `install.sh` does, and what you should see (it is idempotent; run it again 
 1. Checks `python3` >= 3.9 and `lark-cli`. Failure: a line starting with `❌` and exit code 1, nothing is changed.
 2. Validates your `~/.claude/settings.json` before touching anything. A hand-broken file aborts the install untouched.
 3. Symlinks the repo to `~/.claude/lark/app` and `commands/lark.md` to `~/.claude/commands/lark.md`.
-4. Merges six hook entries (`Stop` with `asyncRewake`, `PermissionRequest`, two `UserPromptSubmit` entries of which one is `asyncRewake`, `SessionStart`, `SessionEnd`) into `~/.claude/settings.json`, leaving everything else as it was. Entries written by older versions (a `PreToolUse` hook for `AskUserQuestion`, the env var `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP=1000`) are removed. Output: `已更新 ... （已备份到 ...）` or `无需改动`.
+4. Merges seven hook entries (`Stop` with `asyncRewake`, `PermissionRequest`, two `UserPromptSubmit` entries of which one is `asyncRewake`, two `SessionStart` entries of which one (`session-resume`) is `asyncRewake`, `SessionEnd`) into `~/.claude/settings.json`, leaving everything else as it was. Entries written by older versions (a `PreToolUse` hook for `AskUserQuestion`, the env var `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP=1000`) are removed. Output: `已更新 ... （已备份到 ...）` or `无需改动`.
 5. Records the logged-in Feishu user as the only allowed owner: `已写入 ~/.claude/lark/config.json`.
 6. Runs `claude-lark doctor`. Every check line should start with `✅` and the last line should be `全部通过`. A `❌` line is followed by a `修复：` line telling you what to do; install itself still succeeds.
 
@@ -153,7 +156,18 @@ Type these in an interactive Claude Code session:
 | `/lark <name>` | Same, with your group name (at most 60 characters). Avoid quotes, `$` and backticks in names: the text goes through a shell command line. |
 | `/lark oc_xxxxxxxx` | Bind an existing group by its `chat_id` (starts with `oc_`). The bot must already be in the group (add it in the group settings). **Group links are not supported**: pass the `oc_` id. Find it with `lark-cli im +chat-search --query <name>` (needs `im:chat:read`) or from the group's settings in Feishu. |
 | `/lark off` | Stop syncing (the binding is kept; the group gets a "disconnected" message). |
-| `/lark status` | Show the bound group, whether the bridge is on, and whether the listener process is alive. |
+| `/lark status` | Show the bound group, whether the bridge is on, whether the listener process is alive, and whether auto connect is on. |
+| `/lark auto on` | Turn on auto connect for all sessions (a global switch in `~/.claude/lark/config.json`). See below. |
+| `/lark auto off` | Turn auto connect off. Bridges that are already on stay on. |
+
+**Auto connect (`/lark auto on`).** With the switch on:
+
+- A new interactive session, and a session after `/clear`, creates a group and turns the bridge on right after its first prompt. The group name is the first line of that prompt (at most 20 characters); when it is empty, the session name; when that is empty too, the directory name. Prompts that start with `/lark` do not trigger it.
+- `/resume` of a session that has a bound group reconnects that group at startup. Resume never creates a group.
+- After `/lark off`, the session stays off until you type `/lark` again.
+- The name of a group that claude-lark created follows the session name: both a name you set with `/rename` and a name Claude Code generates are synced. Groups bound with `/lark oc_xxx` are never renamed. Renaming needs the bot scope `im:chat:update`; if it is missing, the group gets one notice and the details go to `~/.claude/lark/errors.log`.
+
+Only the exact text `auto on` / `auto off` is the switch: `/lark auto` or `/lark auto onx` create a group with that name.
 
 If the session already has a bound group, `/lark` reuses it and ignores a group name argument.
 `/lark <chat_id>` on an already bound session is refused: run `/lark off` first. A group can be
@@ -186,7 +200,8 @@ Claude Code as the dialog's answer. This works in every permission mode, auto mo
 - **One listener per Feishu app.** A Feishu app's message events must not be consumed by another machine or program at the same time, or each side receives only part of the messages. Use a separate app per machine, or stop the other consumer.
 - **A keep-alive turn about once a day.** A background hook can wait at most 24 hours. After about 24 hours of silence it wakes Claude once with a keep-alive prompt (Claude replies `waiting`, which is not sent to the group), and the next wait starts.
 - **Haiku is not supported.** See [Usage](#usage).
-- **Resume does not reconnect automatically.** After `claude --resume` the group binding is remembered, but you must type `/lark` to turn the bridge on again (if you resumed in the terminal, you are at the computer).
+- **Resume reconnects only with auto connect.** After `claude --resume` the group binding is remembered. With `/lark auto on` the bridge is turned on again at startup; otherwise you must type `/lark`.
+- **First turn with auto connect.** If the first turn ends before the group is created, the final reply of that turn is not sent to the group. Later turns work normally.
 - **`/clear`, `/resume` and exiting disconnect.** When the bridged conversation ends (`/clear`, switching with `/resume`, or quitting claude), the bridge is turned off and the group gets a notice: 会话已结束（/clear 或退出），桥接已断开。终端里敲 /lark 可重新连接. `/compact` keeps the bridge.
 - **No remote start.** Feishu cannot start `claude`. After a reboot, run `claude --resume` at the computer first.
 - **Single user.** Only the bound owner is listened to; no multi-person collaboration.
@@ -214,8 +229,9 @@ git -C ~/.claude/lark-src pull
 ```
 
 Since `~/.claude/lark/app` is a symlink to the clone, code changes take effect right away. When the
-hook configuration changed (for example the upgrade to the background wait), re-run `install.sh` and
-restart running claude sessions; `claude-lark doctor` reports outdated hooks.
+hook configuration changed (for example the upgrade to the background wait, or the new `session-resume`
+hook used by auto connect), re-run `install.sh` and restart running claude sessions; `claude-lark doctor`
+reports outdated hooks.
 
 ## Development
 

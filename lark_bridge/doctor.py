@@ -102,6 +102,7 @@ def _check_claude(report):
 
 
 READ_SCOPE = "im:message.group_msg:get_as_user"
+RENAME_SCOPE = "im:chat:update"
 # needs_refresh：access token 过期但 refresh token 还有效，下一次调用会自动刷新
 _OK_STATUS = {"ready", "needs_refresh"}
 
@@ -128,6 +129,17 @@ def _check_auth(report):
         )
     else:
         report(True, "bot 与 user 身份均 ready")
+    bot = ids.get("bot") or {}
+    if "bot" not in bad and "scope" in bot:
+        # 只有 auth status 给出 bot 的 scope 时才检查（不给时无法判断，不报告）
+        if RENAME_SCOPE in str(bot.get("scope") or "").split():
+            report(True, f"bot 身份有改群名权限（{RENAME_SCOPE}）")
+        else:
+            report(
+                False,
+                f"bot 身份缺少改群名权限 {RENAME_SCOPE}",
+                f"在飞书开放平台给应用开通 {RENAME_SCOPE} 并发布版本",
+            )
     user = ids.get("user") or {}
     if "user" not in bad:
         scopes = str(user.get("scope") or "").split()
