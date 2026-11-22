@@ -17,6 +17,8 @@
    - `/resume` 一个曾经绑过群的会话，启动时立刻接回那个群；没绑过的，第一句之后建群。
 2. 会话名（`/rename` 设定的，或 Claude Code 自动起的）变化后，由 claude-lark 自己建的群跟着改名。
 
+需求来源说明：`.xdev` 的 issue-body 最初写的是"SessionStart 时建群"。用户在设计讨论中改为"首句之后建群"（含新会话与 `/clear` 后），resume 有 binding 则启动时立刻接回。本文以这一决定为准，issue-body 中与之冲突的部分作废。
+
 非目标：
 
 - 不在会话启动时（还没有第一句时）建群：不用的会话不留空群。
@@ -47,8 +49,8 @@
 
 | 方案 | 取舍 | 结论 |
 |---|---|---|
-| A. 在后台运行的 `UserPromptSubmit` hook（`wait`，asyncRewake）里检测"第一句"并建群；resume 的接回放在改为 asyncRewake 的 SessionStart hook 里 | 不卡终端；只在真正用了的会话建群；确定性，不耗模型回合 | **采用** |
-| B. SessionStart 时就建群 | 不用的会话也会留下空群；用户已明确否决 | 否 |
+| A. 在后台运行的 `UserPromptSubmit` hook（`wait`，asyncRewake）里检测"第一句"并建群；resume 的接回放在新增的 asyncRewake SessionStart hook 里（清理仍留在同步 hook，见 5.3） | 不卡终端；只在真正用了的会话建群；确定性，不耗模型回合 | **采用** |
+| B. SessionStart 时就建群（issue-body 的原始写法） | 不用的会话也会留下空群；用户在设计讨论中已否决（见第 2 节需求来源说明） | 否 |
 | C. 用 hook 输出 additionalContext 让 Claude 自己执行 `/lark` | 每次多耗一个模型回合，且模型可能不执行 | 否 |
 
 群名跟随：
@@ -70,13 +72,25 @@
 
 ### 5.2 首句自动建群
 
-在 `UserPromptSubmit` 的 asyncRewake hook（现有 `wait` 子命令，后台运行）里处理。条件全部满足才建群：
+在 `UserPromptSubmit` 的 asyncRewake hook（现有 `wait` 子命令，后台运行）里处理。注意现有 `hooks.run()` 在会话未开启时直接返回，自动连接要在这个判断之前单独分流。
+
+**统一入口**：自动建群（本节）和 resume 接回（5.3）都调用同一个函数 `commands.auto_connect(sid, source, prompt)`。它在会话目录的 `connect.lock`（阻塞 flock）里依次做：重读 binding → 按下面的规则决定"建群 / 只重试开启 / 什么都不做" → 执行。手动 `/lark` 的建群路径（`_create_and_enable`、`_bind_existing`）也在同一把锁里重读 binding 再决定，这样自动与手动、连发两句之间都不会建出两个群。锁只包住建群和开启，不包住之后的等待。
+
+前置条件（全部满足才继续）：
 
 1. `auto_on` 为真；
-2. 该 session 没有 binding（`binding.json` 不存在）；
-3. 能找到 claude 祖先进程，且 `~/.claude/sessions/<pid>.json` 存在、`kind == "interactive"`、`sessionId` 等于本 session；
-4. prompt 不是以 `/lark` 开头（交给手动 `/lark` 处理），也不是 `<task-notification>` 开头的后台通知；
-5. 同一 session 没有另一个 hook 正在自动建群（用文件锁防并发，例如用户在建群完成前连发两句）。
+2. 能找到 claude 祖先进程，且 `~/.claude/sessions/<pid>.json` 存在、`kind == "interactive"`、`sessionId` 等于本 session；
+3. prompt 不是以 `/lark` 开头（交给手动 `/lark` 处理），也不是 `<task-notification>` 开头的后台通知。
+
+锁内按 binding 状态决定（`source` 为首句时；`source == "resume"` 的规则见 5.3）：
+
+| 状态 | 动作 |
+|---|---|
+| 没有 binding | 建群 + 开启（见下面的建群流程） |
+| 有 binding，且会话目录里有 `auto_pending` 标记 | 群已建出、上次开启失败：复用这个 binding 只重试 `_enable`，**不再建群** |
+| 有 binding，没有 `auto_pending` 标记 | 什么都不做（手动绑定过、或用户 `/lark off` 过） |
+
+`auto_pending` 标记：自动建群在 `create_chat` 成功、落 binding 的**同时**写入（先写标记再写 binding，两者都在锁内）；`_enable` 成功后删除。手动 `/lark`、`/lark off` 不写这个标记，所以 off 过的会话不会被自动重新开启（反目标第 3 条）。
 
 建群流程：
 
@@ -85,22 +99,29 @@
 3. 把这第一句按现有镜像格式（`💻 终端`）发到群里，让手机侧看到上下文。
 4. 然后成为等待进程（现有 `_become_waiter`），保证开启后一定有一个等待进程在等飞书消息。
 
-失败（lark-cli 报错、未登录、没有 owner 等）只写 `errors.log`，hook 安静退出，不影响终端。失败后同一 session 的下一句会再试一次（因为仍然没有 binding）。
+失败只写 `errors.log`，hook 安静退出，不影响终端。按失败发生的位置分两类：
+
+- **建群失败**（`create_chat` 报错、未登录、没有 owner、找不到 claude 进程）：没有 binding，下一句按"没有 binding"重新建群。
+- **群已建出、开启失败**（`_enable` 里读不到 claude 进程启动时间、拉起监听进程出错等）：binding 与 `auto_pending` 都在，下一句只重试开启，不重新建群。
+
+测试要覆盖：开启失败后下一句只调用一次 `+chat-create`（即不重复建群）且最终开启；`/lark off` 之后的下一句不自动开启。
 
 已知限制：如果第一轮在群建好之前就结束了，这一轮的最终回复不会发到群里；后续回合正常。
 
 ### 5.3 resume 接回
 
-SessionStart hook 改为 asyncRewake（后台运行，超时放长）。行为：
+SessionStart 拆成两个 hook 条目，清理与接回分开：
 
-- `source` 为 `startup` / `resume` / `clear`：先按现有逻辑断开残留的 enabled 状态（保留现有行为）。
-- 再看：`source == "resume"`、`auto_on` 为真、会话是交互式（同 5.2 第 3 条）、该 session 有 binding → 用现有 `_enable` 路径接回那个群（群被别的会话占用时不接回，记日志），然后成为等待进程。
-- 其他情况立刻返回。
-- `compact` 不断开，保持现有行为。
+1. **现有的同步 `session-start` 条目保留**（不改成 asyncRewake，超时仍为 10 秒）：`source` 为 `startup` / `resume` / `clear` 时断开残留的 enabled 状态；`compact` 不断开。改动一处：**只断开不属于当前 claude 进程的 enabled**——enabled 文件里记的 pid 与启动时间等于当前 claude 祖先进程的，不删。找不到 claude 祖先进程时退回现有的无条件断开。
+2. **新增 asyncRewake 的 `session-resume` 条目**（后台运行，超时 86400）：`source == "resume"`、`auto_on` 为真、会话是交互式（同 5.2 前置条件第 2 条）、该 session 有 binding → 调用 `auto_connect(source="resume")`：锁内重读到 binding 就调用 `_enable` 接回那个群，不看 `auto_pending`（"绑过就接回"）；没有 binding 则什么都不做，留给首句（resume 路径从不建群；群被别的会话占用时不接回，记日志），然后成为等待进程。其他情况立刻返回。
+
+为什么这样拆：两个 SessionStart 条目可能并行执行，后台进程的调度时间也不确定。如果清理在后台、且无条件删除，它可能晚于接回、首句自动开启或手动 `/lark` 执行，把刚开启的桥接关掉。条件断开之后，当前进程刚写下的 enabled（pid 与启动时间都是当前进程的）不会被清理删掉；残留的 enabled 一定来自别的进程（同一 session 在另一个终端里的旧进程，或已退出的进程），照旧断开。同一进程内切走会话时 SessionEnd 已经断开，不依赖 SessionStart 清理。
+
+测试要覆盖：先开启（写入当前进程的 pid 与启动时间）再执行清理，enabled 仍在；enabled 记的是别的 pid 时，清理会删掉它。
 
 `/lark off` 保留 binding，所以 off 过的会话不会被首句自动建群；之后 resume 时会被接回（用户选择的"绑过就接回"）。
 
-`settings.py` 的 SessionStart 条目改为带 `asyncRewake: true`；`install.sh` 重跑会更新它，README 写明升级后需重跑 `install.sh`。
+`settings.py` 新增 `("SessionStart", None, "session-resume", 86400, _ASYNC)` 条目，原 `session-start` 条目不变；`install.sh` 重跑会写入新条目，README 写明升级后需重跑 `install.sh`。
 
 ### 5.4 群名跟随会话名
 
@@ -111,16 +132,22 @@ Binding 新增两个字段（对旧 binding 文件向后兼容，缺字段时有
 
 **基线规则**：只有会话名与 `synced_name` 不同时才改群名。这样手动 `/lark` 时 Claude 总结的群名不会被当时的自动名覆盖；首句建群后的第一次 `/rename` 会生效。旧 binding 没有 `synced_name` 时，第一次观测只记录基线、不改名。
 
-监听进程每轮轮询（对 enabled 的 binding）：
+监听进程每轮**先完成全部群的消息轮询，再**做改名检查（改名不排在消息拉取前面，不推迟消息接收）。对 enabled 的 binding：
 
 1. 跳过 `created_by_bridge` 为假的 binding。
 2. 读 `~/.claude/sessions/<binding.claude_pid>.json`；文件不存在、解析失败、`sessionId` 不等于 binding 的 session → 跳过。
 3. `name` 去空白后为空 → 跳过。与 `synced_name` 相同 → 跳过。
-4. 不同 → `lark-cli im +chat-update --as bot --chat-id <chat_id> --name <name 截到 60 字符>`（参数以列表传给子进程，不经 shell）。
-   - 成功：更新 binding 的 `chat_name` 和 `synced_name`。
+4. 不同 → `lark-cli im +chat-update --as bot --chat-id <chat_id> --name <name 截到 60 字符>`（参数以列表传给子进程，不经 shell）。超时用监听进程现有的 `SEND_TIMEOUT`（10 秒），不用 `feishu` 默认的 30 秒。每轮读的都是最新的会话名，期间多次改名只会同步最后一个。
+   - 成功：用 `state.update_binding()`（见下）只写 `chat_name` 和 `synced_name`。
    - 失败：写 `errors.log`；同一 binding 60 秒内不再重试；每个 binding 只在群里发一次提示："改群名失败，可能缺少 im:chat:update 权限，详见 errors.log"。
 
 `nameSource` 为 `user` 和 `derived` 都同步。
+
+**binding 写入协议**：现有 `save_binding()` 整份替换。监听进程拿着旧 binding 调网络改名期间，另一个 claude 进程 resume 同一 session 并通过 `_enable` 写入新的 `claude_pid` / `cwd`；监听进程再整份保存就会把 pid 改回旧值，之后元数据读取跳过、watchdog 还可能按旧 pid 已退出断开会话。因此新增 `state.update_binding(sid, fn)`：在会话目录的 `binding.lock`（阻塞 flock）里重读 binding、调用 `fn` 修改、原子写回；`fn` 内不做网络调用。
+
+- 监听进程的名称写回：锁内重读，`chat_id` 与发起改名时不同就放弃写回；否则只改 `chat_name`、`synced_name`。
+- `_enable` 写 `claude_pid` / `cwd`、自动建群首次落 binding，也都通过 `update_binding`（或在同一把锁里 `save_binding`）完成。
+- 测试要覆盖：改名进行中 binding 的 `claude_pid` 被改，写回后 `claude_pid` 仍是新值。
 
 ### 5.5 文档与 doctor
 
@@ -130,6 +157,6 @@ Binding 新增两个字段（对旧 binding 文件向后兼容，缺字段时有
 
 ## 6. 留给实现者的判断
 
-- 自动建群的文件锁、改名重试计时的具体存放位置（会话目录或内存）。
-- 5.2 里"同一 session 并发"之外的竞态（例如自动建群与手动 `/lark` 同时发生）以 binding 是否已存在为准处理，具体实现自定，但不能建出两个群。
+- 改名重试计时的具体存放位置（会话目录或内存）。
+- `connect.lock` 与 `binding.lock` 的获取顺序固定为先 `connect.lock` 后 `binding.lock`，避免死锁；两把锁都不跨越等待飞书消息的阶段。
 - 测试沿用现有 `tests/fake_lark_cli.py` 的方式，给 `+chat-update` 加假实现；会话元数据文件的路径通过环境变量可替换，方便测试隔离。
