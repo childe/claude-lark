@@ -426,14 +426,16 @@ def is_running() -> bool:
     return _lock_held_by_other()
 
 
-def ensure_running() -> None:
-    """监听进程没在跑就在后台拉起一个。自身不抛出。"""
+def ensure_running() -> bool:
+    """监听进程没在跑就在后台拉起一个。自身不抛出。
+
+    监听进程已在跑或本次拉起成功返回 True；拉起出错（已写 errors.log）返回 False。"""
     try:
         # 与监听进程的退出决定（_try_exit）互斥：要么它看到我们刚开启的会话而留下，
         # 要么我们看到存活锁已放掉而拉起新进程
         with _pid_lock():
             if _lock_held_by_other():
-                return
+                return True
             log = paths.listener_log()
             log.parent.mkdir(parents=True, exist_ok=True)
             script = Path(__file__).resolve().parent.parent / "bin" / "claude-lark"
@@ -446,5 +448,7 @@ def ensure_running() -> None:
                     stderr=out,
                     env=dict(os.environ),
                 )
+        return True
     except Exception:
         feishu.log_exception("listener.ensure_running")
+        return False

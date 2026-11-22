@@ -2,10 +2,13 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
+from conftest import write_meta
 from lark_bridge import commands, config, listener, paths, state
 
 SID = "00000000-0000-0000-0000-0000000000c1"
@@ -23,7 +26,7 @@ def fake(lark_home, tmp_path, monkeypatch):
     for k in ("FAKE_LARK_FAIL", "FAKE_LARK_NOT_IN_CHAT"):
         monkeypatch.delenv(k, raising=False)
     started = []
-    monkeypatch.setattr(listener, "ensure_running", lambda: started.append(1))
+    monkeypatch.setattr(listener, "ensure_running", lambda: started.append(1) or True)
     monkeypatch.setattr(commands.procs, "find_claude_ancestor", lambda: os.getpid())
 
     def calls():
@@ -33,6 +36,20 @@ def fake(lark_home, tmp_path, monkeypatch):
 
     calls.started = started
     return calls
+
+
+real_ensure_running = listener.ensure_running
+
+
+@pytest.fixture
+def auto(fake, claude_sessions):
+    write_meta(claude_sessions, os.getpid(), SID)
+    config.set_auto_on(True)
+    return fake
+
+
+def creates(calls):
+    return [c for c in calls() if c[:2] == ["im", "+chat-create"]]
 
 
 def arg(call, flag):
@@ -408,3 +425,184 @@ def test_slash_status_shows_auto(fake):
     assert commands.slash(SID, "status").endswith("；自动连接未开启")
     config.set_auto_on(True)
     assert commands.slash(SID, "status").endswith("；自动连接已开启")
+
+
+# ---------------- auto_connect
+
+
+def test_auto_connect_creates_on_first_prompt(auto):
+    assert commands.auto_connect(SID, "prompt", "  修一下登录 bug\n细节…") == "created"
+    create = creates(auto)
+    assert len(create) == 1 and arg(create[0], "--name") == "修一下登录 bug"
+    b = state.load_binding(SID)
+    assert b.created_by_bridge is True and b.synced_name == "rw-1"
+    assert state.is_enabled(SID) and not state.has_auto_pending(SID)
+
+
+def test_auto_connect_second_prompt_does_nothing(auto):
+    commands.auto_connect(SID, "prompt", "a")
+    state.set_enabled(SID, False)
+    assert commands.auto_connect(SID, "prompt", "b") == ""
+    assert len(creates(auto)) == 1
+
+
+def test_auto_connect_retries_enable_without_recreating(auto, monkeypatch):
+    real = commands._enable
+    monkeypatch.setattr(commands, "_enable", lambda *a, **k: commands._result("boom"))
+    assert commands.auto_connect(SID, "prompt", "a") == ""
+    assert state.has_auto_pending(SID) and state.load_binding(SID) is not None
+    monkeypatch.setattr(commands, "_enable", real)
+    assert commands.auto_connect(SID, "prompt", "b") == "enabled"
+    assert len(creates(auto)) == 1
+    assert state.is_enabled(SID) and not state.has_auto_pending(SID)
+
+
+def listener_popen(monkeypatch, fail):
+    """只拦截拉起监听进程的 Popen（argv 以 listen 结尾）；lark-cli 等调用照常走真实 Popen。
+
+    listener.subprocess 就是全局 subprocess 模块，整体替换会连 fake lark-cli 也拦掉。"""
+    real = subprocess.Popen
+
+    def popen(argv, *a, **k):
+        if list(argv)[-1:] == ["listen"]:
+            if fail:
+                raise OSError("fork failed")
+            return None
+        return real(argv, *a, **k)
+
+    monkeypatch.setattr(listener.subprocess, "Popen", popen)
+
+
+def test_auto_connect_retries_after_listener_spawn_failure(auto, monkeypatch):
+    """真实 _enable 内拉起监听进程失败：不留 enabled、保留 auto_pending，下一句只重试开启。"""
+    monkeypatch.setattr(listener, "ensure_running", real_ensure_running)
+    monkeypatch.setattr(listener, "_lock_held_by_other", lambda: False)
+    listener_popen(monkeypatch, fail=True)
+    assert commands.auto_connect(SID, "prompt", "a") == ""
+    assert not state.is_enabled(SID) and state.has_auto_pending(SID)
+    listener_popen(monkeypatch, fail=False)
+    assert commands.auto_connect(SID, "prompt", "b") == "enabled"
+    assert len(creates(auto)) == 1
+    assert state.is_enabled(SID) and not state.has_auto_pending(SID)
+
+
+def test_auto_pending_then_off_then_prompt_stays_off(auto, monkeypatch):
+    real = commands._enable
+    monkeypatch.setattr(commands, "_enable", lambda *a, **k: commands._result("boom"))
+    commands.auto_connect(SID, "prompt", "a")
+    monkeypatch.setattr(commands, "_enable", real)
+    commands.slash(SID, "off")
+    assert not state.has_auto_pending(SID)
+    assert commands.auto_connect(SID, "prompt", "b") == ""
+    assert not state.is_enabled(SID)
+
+
+def test_manual_lark_after_failed_auto_clears_pending(auto, monkeypatch):
+    real = commands._enable
+    monkeypatch.setattr(commands, "_enable", lambda *a, **k: commands._result("boom"))
+    commands.auto_connect(SID, "prompt", "a")
+    monkeypatch.setattr(commands, "_enable", real)
+    assert commands.slash(SID, "").startswith("RESULT: 已开启桥接")
+    assert not state.has_auto_pending(SID) and state.is_enabled(SID)
+    assert len(creates(auto)) == 1
+
+
+def test_off_then_prompt_does_not_auto_enable(auto):
+    commands.auto_connect(SID, "prompt", "a")
+    commands.slash(SID, "off")
+    assert commands.auto_connect(SID, "prompt", "b") == ""
+    assert not state.is_enabled(SID)
+
+
+@pytest.mark.parametrize("prompt", ["/lark", "/lark 群名", "<task-notification>x"])
+def test_auto_connect_skips_special_prompts(auto, prompt):
+    assert commands.auto_connect(SID, "prompt", prompt) == "" and auto() == []
+
+
+def test_auto_connect_requires_switch_and_interactive(auto, claude_sessions):
+    config.set_auto_on(False)
+    assert commands.auto_connect(SID, "prompt", "a") == ""
+    config.set_auto_on(True)
+    write_meta(claude_sessions, os.getpid(), SID, kind="print")
+    assert commands.auto_connect(SID, "prompt", "a") == "" and auto() == []
+
+
+def test_auto_connect_skips_foreign_or_missing_meta(auto, claude_sessions):
+    write_meta(claude_sessions, os.getpid(), SID2)
+    assert commands.auto_connect(SID, "prompt", "a") == ""
+    (claude_sessions / f"{os.getpid()}.json").write_text("garbage")
+    assert commands.auto_connect(SID, "prompt", "a") == "" and auto() == []
+
+
+def test_auto_connect_without_owner_logs(auto, lark_home):
+    (lark_home / "config.json").write_text('{"auto_on": true}')
+    assert commands.auto_connect(SID, "prompt", "a") == "" and auto() == []
+    assert "owner" in (lark_home / "errors.log").read_text()
+
+
+def test_auto_connect_never_raises(auto, monkeypatch, lark_home):
+    monkeypatch.setenv("FAKE_LARK_FAIL", "1")
+    assert commands.auto_connect(SID, "prompt", "a") == ""
+    assert "commands.auto_connect" in (lark_home / "errors.log").read_text()
+
+
+def test_auto_connect_resume(auto):
+    assert commands.auto_connect(SID, "resume") == ""  # 没 binding 不建群
+    bind(SID, name="手动群")  # 没有 auto_pending
+    assert commands.auto_connect(SID, "resume") == "enabled" and state.is_enabled(SID)
+    assert creates(auto) == []
+
+
+def test_auto_connect_resume_failure_logged(auto, lark_home):
+    bind(SID2, chat="oc_test_chat", pid=os.getpid(), enable=True)
+    bind(SID, name="手动群")
+    assert commands.auto_connect(SID, "resume") == ""
+    assert "群已被会话" in (lark_home / "errors.log").read_text()
+
+
+def test_auto_connect_and_manual_do_not_create_two_chats(auto):
+    """手动 /lark 持有 connect.lock 时，自动连接等它结束后重读到 binding。"""
+    entered = threading.Event()
+
+    def manual():
+        with state.connect_lock(SID):
+            entered.set()
+            time.sleep(0.3)
+            state.save_binding(
+                state.Binding(SID, "oc_manual", "手动群", "/work", None, 0.0)
+            )
+
+    t = threading.Thread(target=manual)
+    t.start()
+    assert entered.wait(5)
+    assert commands.auto_connect(SID, "prompt", "a") == ""
+    t.join(5)
+    assert creates(auto) == []
+    assert state.load_binding(SID).chat_id == "oc_manual"
+
+
+def test_auto_name_fallbacks():
+    assert commands.auto_name("\n  \n", "rw-3", "/a/proj") == "rw-3"
+    assert commands.auto_name("", "", "/a/proj") == "proj"
+    assert commands.auto_name("😀" * 30, "x", "/a") == "😀" * 20
+    assert commands.auto_name("  hi  \nmore", "x", "/a") == "hi"
+    assert commands.auto_name("", "", "/") != ""
+
+
+def test_manual_create_records_baseline(auto):
+    commands.slash(SID, "我的群")
+    b = state.load_binding(SID)
+    assert b.created_by_bridge is True and b.synced_name == "rw-1"
+
+
+def test_bind_existing_not_created_by_bridge(auto):
+    commands.slash(SID, "oc_existing")
+    assert state.load_binding(SID).created_by_bridge is False
+
+
+def test_enable_reports_listener_spawn_failure(fake, monkeypatch):
+    monkeypatch.setattr(listener, "ensure_running", lambda: False)
+    bind(SID, name="旧群")
+    out = commands.slash(SID, "")
+    assert out == "RESULT: 拉起监听进程失败，未开启桥接，详见 errors.log"
+    assert not state.is_enabled(SID)

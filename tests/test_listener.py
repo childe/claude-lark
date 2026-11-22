@@ -674,3 +674,32 @@ def test_item_to_event_maps_api_fields():
     assert e["create_time"] == "1761465600000" and e["mentions"] == []
     item["sender"] = {"id": "cli_test_app", "id_type": "app_id", "sender_type": "app"}
     assert listener.item_to_event(item, "oc_test_chat")["sender_id"] is None
+
+
+# ---------- ensure_running result ----------
+
+
+def test_ensure_running_reports_spawn_failure(fake, lark_home, monkeypatch):
+    def boom(*a, **k):
+        raise OSError("fork failed")
+
+    monkeypatch.setattr(listener, "_lock_held_by_other", lambda: False)
+    monkeypatch.setattr(listener.subprocess, "Popen", boom)
+    assert listener.ensure_running() is False
+    assert "listener.ensure_running" in (lark_home / "errors.log").read_text()
+
+
+def test_ensure_running_true_when_running(fake, monkeypatch):
+    spawned = []
+    monkeypatch.setattr(listener, "_lock_held_by_other", lambda: True)
+    monkeypatch.setattr(listener.subprocess, "Popen", lambda *a, **k: spawned.append(a))
+    assert listener.ensure_running() is True
+    assert spawned == []
+
+
+def test_ensure_running_true_after_spawn(fake, monkeypatch):
+    spawned = []
+    monkeypatch.setattr(listener, "_lock_held_by_other", lambda: False)
+    monkeypatch.setattr(listener.subprocess, "Popen", lambda *a, **k: spawned.append(a))
+    assert listener.ensure_running() is True
+    assert len(spawned) == 1
