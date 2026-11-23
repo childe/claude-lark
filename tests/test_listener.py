@@ -1026,3 +1026,13 @@ def test_main_logs_starting_and_lock_held(fake):
     v = listener.code_version()
     assert f"listener starting (pid {os.getpid()}, version {v})" in log
     assert "listener lock held by another process, exiting" in log
+
+
+def test_any_enabled_readonly_has_no_side_effects(fake):
+    dead = _dead_pid()
+    bind(claude_pid=dead)  # enabled 文件为空，但 claude pid 已死
+    f = paths.session_dir(SID) / "enabled"
+    assert listener.any_enabled_readonly() is False
+    assert f.exists()
+    bind(sid=SID2, chat="oc_2")
+    assert listener.any_enabled_readonly() is True

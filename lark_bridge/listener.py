@@ -298,13 +298,25 @@ def _try_exit() -> bool:
         return True
 
 
+def _claude_gone(b) -> bool:
+    return bool(b.claude_pid) and not procs.pid_alive(b.claude_pid)
+
+
+def any_enabled_readonly() -> bool:
+    """是否有开启中的会话；只读，不关失效会话、不删任何文件（给 doctor 用）。"""
+    for b in state.all_bindings():
+        if state.is_enabled_readonly(b.session_id) and not _claude_gone(b):
+            return True
+    return False
+
+
 def _any_enabled() -> bool:
     """顺手把 claude 进程已退出的会话关掉；返回是否还有开启中的会话。"""
     alive = False
     for b in state.all_bindings():
         if not state.is_enabled(b.session_id):
             continue
-        if b.claude_pid and not procs.pid_alive(b.claude_pid):
+        if _claude_gone(b):
             state.set_enabled(b.session_id, False)
             _log(f"session {b.session_id} disabled: claude pid {b.claude_pid} gone")
             continue
