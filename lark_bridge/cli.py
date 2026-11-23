@@ -19,12 +19,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         from . import listener
 
         return listener.main()
+    if argv == ["restart-listener"]:
+        from . import restart
+
+        return restart.run()
     if argv and argv[0] in ("slash", "on"):
         return _command(argv)
     if argv and argv[0] == "mirror":
         return _mirror(argv)
     print(
-        "用法: claude-lark --version | hook <event> | listen | doctor"
+        "用法: claude-lark --version | hook <event> | listen | restart-listener | doctor"
         " | slash --session <sid> --args <str> | on --session <sid> --name <str>",
         file=sys.stderr,
     )
