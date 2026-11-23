@@ -242,3 +242,10 @@ def test_cli_restart_listener(env, capsys):
     from lark_bridge import cli
 
     assert cli.main(["restart-listener"]) == 0
+
+
+def test_install_restarts_listener_before_doctor():
+    text = (ROOT / "install.sh").read_text()
+    r = text.index('claude-lark" restart-listener || true')
+    d = text.index('claude-lark" doctor || true')
+    assert r < d
