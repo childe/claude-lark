@@ -34,23 +34,42 @@
 
 ## 4. 设计
 
-### 4.1 代码版本
+### 4.1 代码版本与实例信息
 
 - `listener.code_version()`：对 `lark_bridge/*.py` 与 `bin/claude-lark` 的内容按文件名排序后算 sha256，取前 12 位。
-- 监听进程拿到存活锁后，把 `code_version()` 写到 `~/.claude/lark/listener.version`（与 pid 文件同处，原子写）；退出放锁时删掉。
+- 实例信息文件 `~/.claude/lark/listener.version`，内容为 JSON `{"pid": N, "code_version": "V"}`。
+  监听进程在 `_acquire_pid_file()` 里、与写 pid 文件**同一次 `_pid_lock` 内**原子写入；
+  `_drop_life_lock_locked()` 删 pid 文件时一并删除（同样只删 pid 等于自己的那份）。
+  因此在 `_pid_lock` 内看到"存活锁被持有 + 实例信息 pid 为 N"时，N 就是当前锁持有者，不会读到过期 pid。
+- 辅助函数 `listener.instance()`：在 `_pid_lock` 内读取（存活锁是否被持有, 实例信息），供重启命令与 doctor 共用。
+  存活锁未被持有时实例信息视为无效。
 
 ### 4.2 重启命令
 
 新增子命令 `claude-lark restart-listener`，`install.sh` 在 doctor 之前调用它。行为：
 
-1. 监听进程没在跑（`listener.lock` 没被持有）→ 跳到第 4 步。
-2. 读 pid 文件，发 SIGTERM。pid 文件缺失或读不出时，打印 `❌` 行和修复提示（手动结束 `claude-lark listen` 进程），不继续第 3、4 步，退出码非 0。
-3. 等 `listener.lock` 被释放，最多 20 秒（监听进程可能正卡在一次最长 15 秒的 lark-cli 拉取里）。超时后对该 pid 发 SIGKILL，再等最多 5 秒。仍未释放 → `❌` + 修复提示，退出码非 0。
+1. 在 `_pid_lock` 内读取存活锁状态和实例信息（`instance()`）：
+   - 存活锁没被持有 → 放开短锁，跳到第 4 步。
+   - 存活锁被持有，但实例信息缺失、读不出或 pid 与 pid 文件不一致（无法核实实例身份）→ 打印 `❌` 行和修复提示
+     （手动结束 `claude-lark listen` 进程），不发任何信号，退出码非 0。
+   - 否则记下原实例 pid `P`，在同一次 `_pid_lock` 内对 `P` 发 SIGTERM。
+2. 放开短锁后等待原实例退出（等待期间不持有 `_pid_lock`，否则原实例退出时的 `_release_pid_file()` 会被阻塞）。
+   每次轮询在 `_pid_lock` 内取一次 `instance()`，满足任一条件即视为交接完成，进入第 4 步：
+   - 存活锁未被持有；
+   - 存活锁被持有，但实例信息的 pid 已不是 `P`（并发的 `/lark` 或 auto-connect 经 `ensure_running()` 拉起了新实例）。
+3. 最多等 20 秒（监听进程可能正卡在一次最长 15 秒的 lark-cli 拉取里）。超时后在 `_pid_lock` 内重新取 `instance()`，
+   仅当存活锁仍被持有且实例信息 pid 仍为 `P` 时才对 `P` 发 SIGKILL；否则按第 2 步的条件视为交接完成。
+   SIGKILL 后再按第 2 步的条件等最多 5 秒，仍未完成 → `❌` + 修复提示，退出码非 0。
 4. 没有开启中的会话（`_any_enabled()` 为假）→ 打印"没有开启中的会话，不需要监听进程"，退出码 0。
-5. 有开启中的会话 → `ensure_running()`，然后等最多 5 秒确认 `listener.lock` 被持有。没被持有就再调一次 `ensure_running()` 并再等 5 秒。仍失败 → `❌` 行，修复提示指向 `listener.log` 与 `errors.log`，退出码非 0。
-6. 成功打印 `✅ 监听进程已重启（pid N）`。
+   （若第 2 步是被新实例接管的，新实例自己会按现有 watchdog 逻辑决定去留，这里不再干预。）
+5. 有开启中的会话 → `ensure_running()`，然后最多等 5 秒，直到 `instance()` 显示存活锁被持有且实例信息的
+   `code_version` 等于本进程算出的 `code_version()`。不满足就再调一次 `ensure_running()` 并再等 5 秒。
+   仍失败 → `❌` 行，修复提示指向 `listener.log` 与 `errors.log`，退出码非 0。
+   若存活锁被持有但版本不是当前（第 2 步被一个旧版本实例接管，理论上仅在安装途中代码又变化时出现），同样按失败报告。
+6. 成功打印 `✅ 监听进程已重启（pid N，版本 V）`。
 
-`install.sh` 对这一步失败不中止安装（与 doctor 一样 `|| true`），doctor 随后会报告。
+`install.sh` 对这一步失败不中止安装（与 doctor 一样 `|| true`）；`restart-listener` 自己的 `❌` 行已经在安装输出里，
+doctor 随后按 4.4 再报告一次。
 
 ### 4.3 拉起失败可见
 
@@ -61,10 +80,17 @@
 
 ### 4.4 doctor
 
-现有"监听进程运行中"检查扩展：监听进程在跑时读 `listener.version`，与 `code_version()` 比较。
+现有"监听进程"检查（`doctor.py` `_check_listener`）扩展为以下分支，全部基于 `instance()`：
 
-- 一致 → `✅ 监听进程运行中（代码为当前版本）`。
-- 不一致或文件不存在 → `❌ 监听进程运行的是旧代码`，`修复：` 重新运行 `install.sh`（或 `claude-lark restart-listener`）。
+- 监听进程在跑，实例信息的 `code_version` 等于 `code_version()` → `✅ 监听进程运行中（代码为当前版本）`。
+- 监听进程在跑，版本不一致或实例信息不存在 → `❌ 监听进程运行的是旧代码`，`修复：` 重新运行 `install.sh`（或 `claude-lark restart-listener`）。
+- 监听进程没在跑，且没有开启中的会话 → 维持现状：`✅ 监听进程未运行（在会话里 /lark 开启桥接时会自动拉起）`。
+- 监听进程没在跑，但有开启中的会话 → `❌ 有开启中的会话但监听进程未运行`，`修复：` `claude-lark restart-listener`，
+  并提示查看 `listener.log` 与 `errors.log`。
+
+doctor 保持只读："有没有开启中的会话"不能用 `_any_enabled()` 或 `state.is_enabled()`，二者会顺手关闭/删除失效会话的
+enabled 文件。新增只读判断函数（例如 `state.is_enabled_readonly()`），与 `is_enabled()` 共用解析逻辑但不删文件，
+`_any_enabled()` 的判断部分也复用它。
 
 ### 4.5 文档
 
@@ -74,9 +100,18 @@ Install 一节的步骤列表补上重启监听进程这一步。
 ## 5. 测试要求
 
 - `code_version()` 内容变化时变化、不变时不变。
-- 监听进程启动写 version 文件、退出删除。
-- `restart-listener`：没有监听进程；有监听进程且有开启会话（停旧、起新、新进程版本为当前）；有监听进程但没有开启会话（只停不起）；旧进程不响应 SIGTERM 时走 SIGKILL；第一次拉起失败时重试一次。
-- doctor：版本一致、不一致、version 文件缺失三种情况。
+- 监听进程启动时在 `_pid_lock` 内写实例信息（pid 与版本），退出时删除；pid 不是自己时不删。
+- `restart-listener`：
+  - 没有监听进程；
+  - 有监听进程且有开启会话（停旧、起新、新实例的 `code_version` 为当前）；
+  - 有监听进程但没有开启会话（只停不起）；
+  - 旧进程不响应 SIGTERM 时走 SIGKILL；
+  - 第一次拉起失败时重试一次；
+  - 等待期间并发 `ensure_running()` 拉起了新实例：接受交接，不对新旧任何 pid 发 SIGKILL，结果为成功；
+  - SIGKILL 前原实例刚好退出：不发 SIGKILL；
+  - 存活锁被持有但实例信息缺失或与 pid 文件不一致（含上次被 SIGKILL 留下的残留 pid 文件）：不发信号，报告失败。
+- doctor：版本一致、版本不一致、实例信息缺失、"无监听且无开启会话"、"有开启会话但无监听"五种情况；
+  并断言 doctor 运行后失效会话的 enabled 文件未被删除。
 
 ## 6. 留给实现者
 
