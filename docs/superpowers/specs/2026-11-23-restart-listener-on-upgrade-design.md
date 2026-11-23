@@ -40,9 +40,15 @@
 - 实例信息文件 `~/.claude/lark/listener.version`，内容为 JSON `{"pid": N, "code_version": "V"}`。
   监听进程在 `_acquire_pid_file()` 里、与写 pid 文件**同一次 `_pid_lock` 内**原子写入；
   `_drop_life_lock_locked()` 删 pid 文件时一并删除（同样只删 pid 等于自己的那份）。
-  因此在 `_pid_lock` 内看到"存活锁被持有 + 实例信息 pid 为 N"时，N 就是当前锁持有者，不会读到过期 pid。
-- 辅助函数 `listener.instance()`：在 `_pid_lock` 内读取（存活锁是否被持有, 实例信息），供重启命令与 doctor 共用。
-  存活锁未被持有时实例信息视为无效。
+- **实例身份以 pid 文件为准，实例信息文件只提供版本。** 新旧两版代码都在拿存活锁的同一次 `_pid_lock` 内写 pid 文件
+  （旧版见 `listener.py` `_acquire_pid_file()`），且只在放锁的同一次 `_pid_lock` 内删自己的 pid 文件。
+  因此在 `_pid_lock` 内看到"存活锁被持有 + pid 文件为 N"时，N 就是当前锁持有者且仍存活（存活锁的 fd 不被子进程继承），
+  不存在 pid 复用问题，无需另记进程启动标识。这一点对**升级前启动、没有实例信息文件的旧监听进程**同样成立。
+- 辅助函数 `listener.instance()`：在 `_pid_lock` 内读取，返回 `(held, pid, code_version)`，供重启命令与 doctor 共用：
+  - `held`：存活锁是否被持有；未被持有时 `pid`、`code_version` 均为 `None`。
+  - `pid`：pid 文件内容；被持有但 pid 文件缺失或读不出时为 `None`（按上面的不变量不应出现，作为异常处理）。
+  - `code_version`：实例信息文件存在、可解析且其 `pid` 等于 `pid` 时取其值；否则为 `None`，含义是"版本未知"
+    （旧协议进程没有该文件，或文件是上一个被 SIGKILL 的实例留下的残留）。版本未知按"不是当前版本"处理。
 
 ### 4.2 重启命令
 
@@ -50,20 +56,22 @@
 
 1. 在 `_pid_lock` 内读取存活锁状态和实例信息（`instance()`）：
    - 存活锁没被持有 → 放开短锁，跳到第 4 步。
-   - 存活锁被持有，但实例信息缺失、读不出或 pid 与 pid 文件不一致（无法核实实例身份）→ 打印 `❌` 行和修复提示
+   - 存活锁被持有但 `pid` 为 `None`（pid 文件缺失或读不出，无法核实实例身份）→ 打印 `❌` 行和修复提示
      （手动结束 `claude-lark listen` 进程），不发任何信号，退出码非 0。
-   - 否则记下原实例 pid `P`，在同一次 `_pid_lock` 内对 `P` 发 SIGTERM。
+   - 否则记下原实例 pid `P`（来自 pid 文件），在同一次 `_pid_lock` 内对 `P` 发 SIGTERM。
+     `code_version` 为 `None`（升级前启动的旧进程，或残留的实例信息文件）**不阻止**停止，因为这正是本需求要处理的旧进程。
+     旧进程已有 SIGTERM 处理（`main()` 的 `on_sigterm`），会正常放锁退出。
 2. 放开短锁后等待原实例退出（等待期间不持有 `_pid_lock`，否则原实例退出时的 `_release_pid_file()` 会被阻塞）。
    每次轮询在 `_pid_lock` 内取一次 `instance()`，满足任一条件即视为交接完成，进入第 4 步：
    - 存活锁未被持有；
-   - 存活锁被持有，但实例信息的 pid 已不是 `P`（并发的 `/lark` 或 auto-connect 经 `ensure_running()` 拉起了新实例）。
+   - 存活锁被持有，但 `pid` 已不是 `P`（并发的 `/lark` 或 auto-connect 经 `ensure_running()` 拉起了新实例）。
 3. 最多等 20 秒（监听进程可能正卡在一次最长 15 秒的 lark-cli 拉取里）。超时后在 `_pid_lock` 内重新取 `instance()`，
-   仅当存活锁仍被持有且实例信息 pid 仍为 `P` 时才对 `P` 发 SIGKILL；否则按第 2 步的条件视为交接完成。
+   仅当存活锁仍被持有且 `pid` 仍为 `P` 时才对 `P` 发 SIGKILL；否则按第 2 步的条件视为交接完成。
    SIGKILL 后再按第 2 步的条件等最多 5 秒，仍未完成 → `❌` + 修复提示，退出码非 0。
 4. 没有开启中的会话（`_any_enabled()` 为假）→ 打印"没有开启中的会话，不需要监听进程"，退出码 0。
    （若第 2 步是被新实例接管的，新实例自己会按现有 watchdog 逻辑决定去留，这里不再干预。）
-5. 有开启中的会话 → `ensure_running()`，然后最多等 5 秒，直到 `instance()` 显示存活锁被持有且实例信息的
-   `code_version` 等于本进程算出的 `code_version()`。不满足就再调一次 `ensure_running()` 并再等 5 秒。
+5. 有开启中的会话 → `ensure_running()`，然后最多等 5 秒，直到 `instance()` 显示存活锁被持有且
+   `code_version`（实例信息 pid 与 pid 文件一致时才有值）等于本进程算出的 `code_version()`。不满足就再调一次 `ensure_running()` 并再等 5 秒。
    仍失败 → `❌` 行，修复提示指向 `listener.log` 与 `errors.log`，退出码非 0。
    若存活锁被持有但版本不是当前（第 2 步被一个旧版本实例接管，理论上仅在安装途中代码又变化时出现），同样按失败报告。
 6. 成功打印 `✅ 监听进程已重启（pid N，版本 V）`。
@@ -83,7 +91,7 @@ doctor 随后按 4.4 再报告一次。
 现有"监听进程"检查（`doctor.py` `_check_listener`）扩展为以下分支，全部基于 `instance()`：
 
 - 监听进程在跑，实例信息的 `code_version` 等于 `code_version()` → `✅ 监听进程运行中（代码为当前版本）`。
-- 监听进程在跑，版本不一致或实例信息不存在 → `❌ 监听进程运行的是旧代码`，`修复：` 重新运行 `install.sh`（或 `claude-lark restart-listener`）。
+- 监听进程在跑，版本不一致或版本未知（`code_version` 为 `None`，含升级前启动的旧进程）→ `❌ 监听进程运行的是旧代码`，`修复：` 重新运行 `install.sh`（或 `claude-lark restart-listener`）。
 - 监听进程没在跑，且没有开启中的会话 → 维持现状：`✅ 监听进程未运行（在会话里 /lark 开启桥接时会自动拉起）`。
 - 监听进程没在跑，但有开启中的会话 → `❌ 有开启中的会话但监听进程未运行`，`修复：` `claude-lark restart-listener`，
   并提示查看 `listener.log` 与 `errors.log`。
@@ -109,8 +117,11 @@ Install 一节的步骤列表补上重启监听进程这一步。
   - 第一次拉起失败时重试一次；
   - 等待期间并发 `ensure_running()` 拉起了新实例：接受交接，不对新旧任何 pid 发 SIGKILL，结果为成功；
   - SIGKILL 前原实例刚好退出：不发 SIGKILL；
-  - 存活锁被持有但实例信息缺失或与 pid 文件不一致（含上次被 SIGKILL 留下的残留 pid 文件）：不发信号，报告失败。
-- doctor：版本一致、版本不一致、实例信息缺失、"无监听且无开启会话"、"有开启会话但无监听"五种情况；
+  - **迁移**：旧协议监听进程（存活锁被持有，只有 pid 文件，没有实例信息文件）且有开启会话：对 pid 文件中的 pid 发 SIGTERM，
+    停旧起新，新实例 `code_version` 为当前，结果为成功；
+  - 实例信息文件是残留（其 pid 与 pid 文件不一致）：按版本未知处理，照常停旧起新；
+  - 存活锁被持有但 pid 文件缺失：不发信号，报告失败。
+- doctor：版本一致、版本不一致、版本未知（无实例信息文件，即旧协议进程）、"无监听且无开启会话"、"有开启会话但无监听"五种情况；
   并断言 doctor 运行后失效会话的 enabled 文件未被删除。
 
 ## 6. 留给实现者
