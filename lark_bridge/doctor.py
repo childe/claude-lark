@@ -196,8 +196,24 @@ def _check_owner(report, current):
 def _check_listener(report):
     from . import listener
 
-    if listener.is_running():
-        report(True, "监听进程运行中")
+    held, _, ver = listener.instance()
+    if held and ver == listener.code_version():
+        report(True, "监听进程运行中（代码为当前版本）")
+    elif held:
+        # 没有实例信息（旧版本监听进程）也算旧代码
+        report(
+            False,
+            "监听进程运行的是旧代码",
+            "重新运行 ./install.sh（或 claude-lark restart-listener）",
+        )
+    elif listener.any_enabled_readonly():
+        # 只读判断：doctor 不能顺手关掉失效会话，否则改变了它要报告的状态
+        report(
+            False,
+            "有开启中的会话但监听进程未运行",
+            f"claude-lark restart-listener；仍失败时查看 {paths.listener_log()}"
+            f" 与 {paths.home() / 'errors.log'}",
+        )
     else:
         # 没有会话开着桥接时监听进程本来就不会常驻，这不算故障
         report(True, "监听进程未运行（在会话里 /lark 开启桥接时会自动拉起）")

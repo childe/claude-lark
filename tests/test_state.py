@@ -362,3 +362,18 @@ def test_connect_lock_serializes(lark_home):
         order.append("b")
     t.join(5)
     assert order == ["a", "b"]
+
+
+def test_is_enabled_readonly_keeps_stale_file(lark_home):
+    state.save_binding(mk())
+    f = paths.session_dir(SID) / "enabled"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("999999\nticks:1")  # 已死的 pid
+    assert state.is_enabled_readonly(SID) is False
+    assert f.exists()
+    f.write_text("")
+    assert state.is_enabled_readonly(SID) is True
+    state.set_enabled(SID, True, claude_pid=os.getpid())
+    assert state.is_enabled_readonly(SID) is True
+    f.unlink()
+    assert state.is_enabled_readonly(SID) is False

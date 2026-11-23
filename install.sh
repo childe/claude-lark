@@ -60,7 +60,11 @@ config.set_owner(oid)
 print("已写入 %s" % paths.config_file())
 '
 
-# 6. 自检（失败不让安装失败：doctor 会打印怎么修）
+# 6. 重启监听进程（升级后让它运行新代码；失败不让安装失败）
+echo
+"$LARK_DIR/app/bin/claude-lark" restart-listener || true
+
+# 7. 自检（失败不让安装失败：doctor 会打印怎么修）
 echo
 "$LARK_DIR/app/bin/claude-lark" doctor || true
 

@@ -40,6 +40,11 @@ def listener_lock_file() -> Path:
     return home() / "listener.lock"
 
 
+def listener_version_file() -> Path:
+    """监听进程的实例信息：{"pid": N, "code_version": "V"}。"""
+    return home() / "listener.version"
+
+
 def listener_log() -> Path:
     return home() / "listener.log"
 

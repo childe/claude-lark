@@ -143,20 +143,16 @@ def clear_auto_pending(sid):
         pass
 
 
-def is_enabled(sid) -> bool:
-    """enabled 文件存在，且（记了 pid 时）那个 claude 进程还是当初那个。
-
-    文件内容是 "<pid>\\n<启动时间>"：pid 活着且启动时间一致才算开启，
-    pid 被别的进程复用（例如重启后）就不算。只有 pid 的旧格式也不算。
-    空文件（没有 pid）算开启。判定为失效时顺手删掉 enabled。"""
+def _enabled_check(sid):
+    """读 enabled 文件并判定；文件不存在返回 None，否则 (alive, raw, reason)。不改任何东西。"""
     f = paths.session_dir(sid) / "enabled"
     try:
         raw = f.read_text()
     except OSError:
-        return False
+        return None
     content = raw.strip()
     if not content:
-        return True
+        return True, raw, ""
     pid_s, _, start = content.partition("\n")
     start = " ".join(start.split())
     try:
@@ -175,7 +171,21 @@ def is_enabled(sid) -> bool:
         # ps 偶尔取不到（进程刚好退出等）时无法否定，按 pid 存活判断
         alive = not now or now == start
         reason = f"claude pid {pid} start time changed: {start!r} -> {now!r}"
+    return alive, raw, reason
+
+
+def is_enabled(sid) -> bool:
+    """enabled 文件存在，且（记了 pid 时）那个 claude 进程还是当初那个。
+
+    文件内容是 "<pid>\\n<启动时间>"：pid 活着且启动时间一致才算开启，
+    pid 被别的进程复用（例如重启后）就不算。只有 pid 的旧格式也不算。
+    空文件（没有 pid）算开启。判定为失效时顺手删掉 enabled。"""
+    checked = _enabled_check(sid)
+    if checked is None:
+        return False
+    alive, raw, reason = checked
     if not alive:
+        f = paths.session_dir(sid) / "enabled"
         removed = False
         with _enabled_lock(sid):
             # 判定期间可能被重新开启：内容仍是当初读到的才删
@@ -188,6 +198,12 @@ def is_enabled(sid) -> bool:
         if removed:
             feishu.log_error(f"session {sid} disabled: {reason}")
     return alive
+
+
+def is_enabled_readonly(sid) -> bool:
+    """与 is_enabled 判定相同，但从不删 enabled 文件、不写 errors.log。"""
+    checked = _enabled_check(sid)
+    return checked is not None and checked[0]
 
 
 def enabled_at_ms(sid):
