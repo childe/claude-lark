@@ -6,6 +6,7 @@
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import signal
@@ -15,6 +16,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
+from typing import Optional, Tuple
 
 from . import feishu, meta, paths, procs, state
 from .text import render_content, strip_mentions
@@ -184,8 +186,57 @@ def _lock_held_by_other() -> bool:
     return False
 
 
-def _acquire_pid_file() -> bool:
-    """拿存活锁并写 pid 文件；锁被别人持有（已有监听进程）返回 False。"""
+def code_version(root: Optional[Path] = None) -> str:
+    """当前代码的版本：lark_bridge/*.py 与 bin/claude-lark 内容的 sha256 前 12 位。"""
+    if root is None:
+        root = Path(__file__).resolve().parent.parent
+    root = Path(root)
+    files = sorted((root / "lark_bridge").glob("*.py")) + [root / "bin" / "claude-lark"]
+    files.sort(key=lambda f: f.relative_to(root).as_posix())
+    h = hashlib.sha256()
+    for f in files:
+        try:
+            content = f.read_bytes()
+        except OSError:
+            content = b""
+        h.update(f.relative_to(root).as_posix().encode() + b"\0" + content + b"\0")
+    return h.hexdigest()[:12]
+
+
+def _read_instance_info():
+    """读实例信息文件；不存在、损坏或字段不对返回 None。"""
+    try:
+        data = json.loads(paths.listener_version_file().read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    pid = data.get("pid")
+    ver = data.get("code_version")
+    if type(pid) is not int or not isinstance(ver, str) or not ver:
+        return None
+    return pid, ver
+
+
+def _instance_locked() -> Tuple[bool, Optional[int], Optional[str]]:
+    """调用方持有 _pid_lock：(存活锁是否被持有, pid 文件里的 pid, 代码版本)。
+
+    实例身份以 pid 文件为准；实例信息文件的 pid 与之相等时才取其版本。"""
+    if not _lock_held_by_other():
+        return False, None, None
+    pid = _read_pid()
+    info = _read_instance_info()
+    ver = info[1] if info is not None and pid is not None and info[0] == pid else None
+    return True, pid, ver
+
+
+def instance() -> Tuple[bool, Optional[int], Optional[str]]:
+    with _pid_lock():
+        return _instance_locked()
+
+
+def _acquire_pid_file(version: str) -> bool:
+    """拿存活锁并写 pid 文件与实例信息；锁被别人持有（已有监听进程）返回 False。"""
     with _pid_lock():
         p = paths.listener_lock_file()
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -200,15 +251,25 @@ def _acquire_pid_file() -> bool:
             raise
         _life["f"] = f
         state._atomic_write(paths.listener_pid_file(), str(os.getpid()))
+        state._atomic_write(
+            paths.listener_version_file(),
+            json.dumps({"pid": os.getpid(), "code_version": version}),
+        )
         return True
 
 
 def _drop_life_lock_locked() -> None:
-    """调用方持有 _pid_lock：删掉自己的 pid 文件，放掉存活锁。"""
+    """调用方持有 _pid_lock：删掉自己的 pid 文件与实例信息，放掉存活锁。"""
     try:
         if _read_pid() == os.getpid():
             paths.listener_pid_file().unlink()
     except OSError:
+        pass
+    try:
+        info = _read_instance_info()
+        if info is not None and info[0] == os.getpid():
+            paths.listener_version_file().unlink()
+    except (OSError, ValueError):
         pass
     f, _life["f"] = _life["f"], None
     if f is not None:
@@ -436,7 +497,10 @@ def main(
     poll_interval: float = POLL_INTERVAL,
     idle_interval: float = IDLE_POLL_INTERVAL,
 ) -> int:
-    if not _acquire_pid_file():
+    version = code_version()
+    _log(f"listener starting (pid {os.getpid()}, version {version})")
+    if not _acquire_pid_file(version):
+        _log("listener lock held by another process, exiting")
         return 0
     stop = threading.Event()
 

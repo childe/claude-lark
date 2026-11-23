@@ -916,3 +916,113 @@ def test_rename_skipped_when_stopped(fake, claude_sessions, clock):
     stop.set()
     listener._Poller(60).poll_once(stop)
     assert renames(fake) == []
+
+
+# ---------- 代码版本与实例信息 ----------
+
+
+def _mk_tree(root, files):
+    (root / "lark_bridge").mkdir(parents=True)
+    (root / "bin").mkdir()
+    for rel, text in files.items():
+        (root / rel).write_text(text)
+
+
+def test_code_version_changes_with_content(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    files = {"lark_bridge/x.py": "1", "lark_bridge/y.py": "2", "bin/claude-lark": "3"}
+    _mk_tree(a, files)
+    _mk_tree(b, files)
+    va = listener.code_version(a)
+    assert len(va) == 12 and all(c in "0123456789abcdef" for c in va)
+    assert listener.code_version(b) == va
+    (b / "lark_bridge/y.py").write_text("2 changed")
+    assert listener.code_version(b) != va
+    (a / "lark_bridge/notes.txt").write_text("ignored")  # 非 .py 不计入
+    assert listener.code_version(a) == va
+    (a / "bin/claude-lark").write_text("3 changed")
+    assert listener.code_version(a) != va
+
+
+def test_code_version_default_root_is_repo():
+    assert listener.code_version() == listener.code_version(ROOT)
+
+
+def test_main_writes_and_removes_version_file(fake):
+    claude = subprocess.Popen(["sleep", "60"])
+    bind(claude_pid=claude.pid)
+    seen = []
+
+    def watcher():
+        _wait(lambda: _polls(fake))
+        seen.append(json.loads(paths.listener_version_file().read_text()))
+        seen.append(listener.instance())
+        claude.kill()
+        claude.wait()
+
+    th = threading.Thread(target=watcher)
+    th.start()
+    listener.main(check_interval=0.1, poll_interval=0.1)
+    th.join()
+    v = listener.code_version()
+    assert seen[0] == {"pid": os.getpid(), "code_version": v}
+    assert seen[1] == (True, os.getpid(), v)
+    assert not paths.listener_version_file().exists()
+    assert listener.instance() == (False, None, None)
+
+
+def test_drop_keeps_foreign_version_file(fake):
+    bind()
+    assert listener._acquire_pid_file("abc")
+    paths.listener_version_file().write_text(
+        json.dumps({"pid": 1, "code_version": "x"})
+    )
+    listener._release_pid_file()
+    assert json.loads(paths.listener_version_file().read_text())["pid"] == 1
+
+
+def test_instance_old_protocol_and_stale_version(fake):
+    other = _hold_listener_lock()
+    try:
+        assert listener.instance() == (True, None, None)  # 锁被持有但没有 pid 文件
+        paths.listener_pid_file().write_text(str(os.getppid()))
+        assert listener.instance() == (True, os.getppid(), None)  # 旧协议：无实例信息
+        paths.listener_version_file().write_text(
+            json.dumps({"pid": 999999, "code_version": "v"})
+        )
+        assert listener.instance() == (True, os.getppid(), None)  # 残留
+    finally:
+        other.close()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "not json",
+        "[1]",
+        '{"pid": 5}',
+        '{"code_version": "v"}',
+        '{"pid": "5", "code_version": "v"}',
+    ],
+)
+def test_instance_corrupt_version_file(fake, content):
+    other = _hold_listener_lock()
+    try:
+        paths.listener_pid_file().write_text("5")
+        paths.listener_version_file().write_text(content)
+        assert listener.instance() == (True, 5, None)
+    finally:
+        other.close()
+
+
+def test_main_logs_starting_and_lock_held(fake):
+    bind()
+    other = _hold_listener_lock()
+    try:
+        assert listener.main(check_interval=0.1, poll_interval=0.1) == 0
+    finally:
+        other.close()
+    log = paths.listener_log().read_text()
+    v = listener.code_version()
+    assert f"listener starting (pid {os.getpid()}, version {v})" in log
+    assert "listener lock held by another process, exiting" in log
