@@ -44,7 +44,7 @@ claude-lark 把一个**正在运行**的 Claude Code 会话桥接到飞书群，
 - 安装：`git clone https://github.com/childe/claude-lark ~/.claude/lark-src && ~/.claude/lark-src/install.sh`，然后重启已经开着的 claude 会话。
 - 前置：Python ≥ 3.9、Claude Code ≥ 2.1.287、`lark-cli` ≥ 1.0.92，以及一个开了机器人能力的飞书自建应用（不需要订阅事件）。
 - 收消息：监听进程以**你的 user 身份**每 2 秒拉一次已开启群的消息，不占用应用的事件长连接，所以同一个应用被别的后端订阅着也不影响。
-- 自动连接：`/lark auto on` 之后，新会话发出第一句就自动建群并开启桥接，`/resume` 绑过群的会话时自动接回；`/lark auto off` 关闭。claude-lark 自己建的群，群名跟着会话名（`/rename` 或自动起的名字）改。
+- 自动连接：`/lark auto on` 之后，新会话发出第一句就自动建群并开启桥接，`/resume` 绑过群的会话时自动接回；`/lark auto off` 关闭。这个开关是全局的，保存在 `~/.claude/lark/config.json` 的 `auto_on` 字段，重跑 `install.sh` 不会改掉它。claude-lark 自己建的群，群名跟着会话名（`/rename` 或自动起的名字）改。
 - 限制：没开 `auto on` 时 resume 后不自动重连；不能从飞书远程启动 claude。
 - 从旧版本升级：`git pull` 之后**重新运行 `install.sh`**（hook 配置变了），再重启已经开着的 claude 会话。
 - 把仓库链接贴给你的 AI 助手说"帮我装"也可以，见 [For AI agents](#for-ai-agents)。
@@ -157,7 +157,7 @@ Type these in an interactive Claude Code session:
 | `/lark oc_xxxxxxxx` | Bind an existing group by its `chat_id` (starts with `oc_`). The bot must already be in the group (add it in the group settings). **Group links are not supported**: pass the `oc_` id. Find it with `lark-cli im +chat-search --query <name>` (needs `im:chat:read`) or from the group's settings in Feishu. |
 | `/lark off` | Stop syncing (the binding is kept; the group gets a "disconnected" message). |
 | `/lark status` | Show the bound group, whether the bridge is on, whether the listener process is alive, and whether auto connect is on. |
-| `/lark auto on` | Turn on auto connect for all sessions (a global switch in `~/.claude/lark/config.json`). See below. |
+| `/lark auto on` | Turn on auto connect for all sessions (a global switch: the field `"auto_on"` in `~/.claude/lark/config.json`; re-running `install.sh` keeps it). See below. |
 | `/lark auto off` | Turn auto connect off. Bridges that are already on stay on. |
 
 **Auto connect (`/lark auto on`).** With the switch on:
